@@ -13,12 +13,18 @@ Input files must be migrated to English headers before running this script.
 This script does not translate existing input files or legacy downstream schemas.
 
 A subject enters the analysis set (analysis_pass in *_qc.csv, rows of
-*_analysis.csv) only if extraction succeeded, it is not on the P1 failure list,
-P8 QC passed with a numeric registration Dice, its P8 label carries the
-corrected grid-conversion tag, and P8 used the same QSM file. An ROI value is
-reported only when the ROI has enough valid voxels, valid volume (mm3) and
-coverage of its T1-space volume. Worklist IDs whose repeated rows disagree
-(e.g. two hospital_ids or diagnoses) are excluded and listed in *_excluded.csv.
+*_analysis.csv) only if extraction succeeded with at least --min-reportable-rois
+reported ROI values, it is not on the P1 failure list, P8 QC passed with a
+numeric registration Dice, its P8 label carries the corrected grid-conversion
+tag, and the QSM file, label and T1 segmentation are the ones P8 used and
+checked. An ROI value is reported only when the ROI has enough valid voxels,
+valid volume (mm3) and coverage of a finite, positive T1-space volume. Worklist
+IDs whose repeated rows disagree (e.g. two hospital_ids or diagnoses) are
+excluded and listed in *_excluded.csv.
+
+Formal extraction reads QSM support masks (--support-dir; see make_support_masks.py).
+The nonzero-QSM proxy (--allow-nonzero-proxy) is for diagnostics and sensitivity
+analyses only: its output file names carry _proxy and *_qc.csv records the mode.
 """
 
 import argparse
@@ -334,10 +340,11 @@ def extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, min_voxels, min_mm3, min
     """Per-ROI statistics, counts and coverage for one subject on the native grid.
 
     An ROI value is reported only with at least min_voxels valid voxels, at least
-    min_mm3 of valid volume and, if min_coverage > 0, valid volume covering at
-    least min_coverage of the ROI's T1-space volume. Coverage relative to T1 also
-    counts cortex outside the QSM field of view, which the label on the QSM grid
-    cannot show.
+    min_mm3 of valid volume and, if min_coverage > 0, a finite, positive T1-space
+    volume of which the valid volume covers at least min_coverage. Coverage
+    relative to T1 also counts cortex outside the QSM field of view, which the
+    label on the QSM grid cannot show. The status is OK only if at least one ROI
+    value survives these gates and the label agrees with the T1 segmentation.
     """
     n_keys = len(keys)
     lut = np.full(int(max(keys)) + 1, -1, dtype=np.int32)
@@ -365,25 +372,39 @@ def extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, min_voxels, min_mm3, min
             medians[i] = float(np.median(v_sorted[bounds[i]:bounds[i + 1]]))
 
     valid_mm3 = counts * vox_mm3
-    with np.errstate(divide="ignore", invalid="ignore"):
-        coverage = valid_mm3 / t1_mm3
+    # Coverage is defined only for a finite, positive T1 volume; otherwise it is NaN
+    # (never inf), and NaN fails the gate whenever the gate is on.
+    t1_ok = np.isfinite(t1_mm3) & (t1_mm3 > 0)
+    coverage = np.full(n_keys, np.nan)
+    coverage[t1_ok] = valid_mm3[t1_ok] / t1_mm3[t1_ok]
     low_count = (counts < min_voxels) | (valid_mm3 < min_mm3)
-    # NaN coverage (no T1 volume) fails the comparison and is withheld when the gate is on.
-    low_coverage = ~low_count & (min_coverage > 0) & ~(coverage >= min_coverage)
+    low_coverage = ~low_count & (min_coverage > 0) & ~(np.isfinite(coverage) & (coverage >= min_coverage))
     means[low_count | low_coverage] = np.nan
     medians[low_count | low_coverage] = np.nan
+    n_reportable = int(np.isfinite(medians).sum())
+
+    # The label is resampled from the T1 segmentation, so with that segmentation in hand
+    # (any finite volume; all NaN means none was read) every ROI present on the QSM grid
+    # must have a finite, positive T1 volume; otherwise they disagree.
+    t1_known = bool(np.isfinite(t1_mm3).any())
+    n_label_without_t1 = int(((label_counts > 0) & ~t1_ok).sum()) if t1_known else 0
 
     if not label_counts.any():
         status = "No cortical labels"
+    elif n_label_without_t1:
+        status = (f"Label and T1 segmentation disagree ({n_label_without_t1} ROIs on the QSM "
+                  "grid have no T1 volume)")
     elif not counts.any():
         status = "No valid supported cortical voxels"
+    elif not n_reportable:
+        status = "No ROI value passes the voxel, volume and coverage gates"
     else:
         status = "OK"
     iqr = float(np.subtract(*np.percentile(v, [75, 25]))) if v.size else float("nan")
     return {"status": status, "label_counts": label_counts, "counts": counts,
             "means": means, "medians": medians, "coverage": coverage,
             "n_low_voxels": int(low_count.sum()), "n_low_coverage": int(low_coverage.sum()),
-            "cortex_iqr": iqr}
+            "n_reportable": n_reportable, "cortex_iqr": iqr}
 
 
 def native_csf_reference(lab, qsm, valid, min_voxels=30):
@@ -399,7 +420,9 @@ def native_csf_reference(lab, qsm, valid, min_voxels=30):
 def process_subject(task, keys, opts):
     """Load one subject once; return ROI statistics, T1-space coverage and the CSF reference.
 
-    Any error becomes the returned status, so one unreadable file cannot stop the cohort run.
+    Content hashes of the label and T1 segmentation are returned for comparison with
+    the ones P8 recorded. Any error becomes the returned status, so one unreadable
+    file cannot stop the cohort run.
     """
     try:
         lab, qsm, valid, zooms, vox_mm3 = load_native_grid(task["label"], task["qsm"],
@@ -408,7 +431,9 @@ def process_subject(task, keys, opts):
                   else np.full(len(keys), np.nan))
         res = extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, opts["min_voxels"],
                           opts["min_mm3"], opts["min_coverage"])
-        res.update(t1_mm3=t1_mm3, vox_mm3=vox_mm3, pixdim="x".join(f"{z:.4g}" for z in zooms))
+        res.update(t1_mm3=t1_mm3, vox_mm3=vox_mm3, pixdim="x".join(f"{z:.4g}" for z in zooms),
+                   label_sha1=file_digest(task["label"]),
+                   t1seg_sha1=file_digest(task["t1seg"]) if task["t1seg"] is not None else "")
         if opts["csf_ref"]:
             res["csf_ref"], res["csf_voxels"] = native_csf_reference(lab, qsm, valid,
                                                                      opts["min_csf_voxels"])
@@ -500,7 +525,8 @@ def main():
     ap.add_argument("--support-dir", type=Path, default=None,
                     help="Directory of valid QSM support masks named <IID>_support.nii[.gz]")
     ap.add_argument("--allow-nonzero-proxy", action="store_true",
-                    help="Without a support mask, use nonzero QSM as a provisional coverage proxy (diagnostics/sensitivity analysis only)")
+                    help="Without a support mask, use nonzero QSM as a provisional coverage proxy "
+                         "(diagnostics/sensitivity analysis only; every output file name carries _proxy)")
     ap.add_argument("--which", default="",
                     help="With --ids-file, filter further by 'column=value', e.g., pilot_group=primary_pair")
     ap.add_argument("--stat", choices=("both", "median", "mean"), default="both")
@@ -511,6 +537,9 @@ def main():
     ap.add_argument("--min-coverage", type=float, default=0.5,
                     help="Minimum fraction of the ROI's T1-space volume with valid QSM; 0 disables "
                          "(uses the P8 t1seg output)")
+    ap.add_argument("--min-reportable-rois", type=int, default=1,
+                    help="Minimum ROIs with a reported value for a subject to enter the analysis set "
+                         "(68 keeps complete cases only, for models that need every ROI)")
     ap.add_argument("--allow-legacy-labels", action="store_true",
                     help="Accept P8 labels built before the grid-conversion fix (only for subjects that "
                          "check_grid_conversion.py reports as unaffected)")
@@ -526,14 +555,22 @@ def main():
         ap.error("--which filters the --ids-file list; give --ids-file as well")
     if not 0.0 <= args.min_coverage <= 1.0:
         ap.error("--min-coverage must be between 0 and 1")
+    if not 1 <= args.min_reportable_rois <= len(FS_L) + len(FS_R):
+        ap.error(f"--min-reportable-rois must be between 1 and {len(FS_L) + len(FS_R)}")
+    coverage_mode = "support_mask" if args.support_dir else "nonzero_proxy"
+    if args.support_dir and args.allow_nonzero_proxy:
+        print("Note: --support-dir given; --allow-nonzero-proxy is ignored")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     label_dir = args.native_dir / "label"
     t1seg_dir = args.native_dir / "t1seg"
     qc_dir = args.native_dir / "qc"
-    sfx = args.suffix
-    if args.sample_root and not sfx:
-        sfx = "_sample_debug"
+    # Proxy-mode (diagnostic/sensitivity) outputs never share file names with formal ones.
+    sfx = ("_proxy" if coverage_mode == "nonzero_proxy" else "") + args.suffix
+    if args.sample_root and not args.suffix:
+        sfx += "_sample_debug"
+    print(f"Coverage mode: {coverage_mode}"
+          + ("" if args.support_dir else " (diagnostic/sensitivity only; output names carry _proxy)"))
 
     def out_path(tail):
         return args.out_dir / f"HUASHAN_NATIVE_DK{sfx}{tail}"
@@ -693,6 +730,15 @@ def main():
     grid_ok = np.array([f.get("grid_conversion") == GRID_CONVERSION_TAG for _, _, f in p8_qc])
     qsm_match = np.array([same_file(t["qsm"], f.get("qsm", ""))
                           for t, (_, _, f) in zip(tasks, p8_qc)])
+
+    def matches_p8(key, field):
+        """True/False when both the file hash and P8's record exist, else None."""
+        return [None if not (r.get(key) and f.get(field)) else r[key] == f[field]
+                for r, (_, _, f) in zip(results, p8_qc)]
+
+    label_match = matches_p8("label_sha1", "label_sha1")
+    t1seg_match = matches_p8("t1seg_sha1", "t1seg_sha1")
+    n_reportable = np.array([r.get("n_reportable", 0) for r in results], dtype=int)
     fail_reasons = []
     for i in range(n_sub):
         why = []
@@ -711,6 +757,19 @@ def main():
                 why.append("P8 label predates grid-conversion fix")
             if not qsm_match[i]:
                 why.append("QSM differs from the file P8 used")
+            # The QC verdict and the coverage denominators must belong to the files read here.
+            if label_match[i] is False:
+                why.append("label differs from the one P8 QC checked")
+            elif label_match[i] is None and "label_sha1" not in p8_qc[i][2] and not args.allow_legacy_labels:
+                why.append("P8 QC has no label provenance")
+            if args.min_coverage > 0:
+                if t1seg_match[i] is False:
+                    why.append("T1 segmentation differs from the one P8 used")
+                elif (t1seg_match[i] is None and "t1seg_sha1" not in p8_qc[i][2]
+                      and not args.allow_legacy_labels):
+                    why.append("P8 QC has no segmentation provenance")
+        if status[i] == "OK" and n_reportable[i] < args.min_reportable_rois:
+            why.append(f"{n_reportable[i]} reportable ROIs < --min-reportable-rois {args.min_reportable_rois}")
         if args.csf_ref and not np.isfinite(csf_values[i]):
             why.append("CSF reference unavailable")
         fail_reasons.append("; ".join(why))
@@ -736,6 +795,8 @@ def main():
         "IID": ids,
         "analysis_pass": analysis_pass,
         "fail_reasons": fail_reasons,
+        "coverage_mode": coverage_mode,
+        "support_mask": [str(t["support"] or "") for t in tasks],
         "extract_status": status,
         "extract_detail": ["" if s == "OK" else s for s in status],
         "P1_failed_list": p1_failed,
@@ -748,6 +809,8 @@ def main():
         "P8_grid_conversion": [x[2].get("grid_conversion", "") for x in p8_qc],
         "P8_t1_neurological": [x[2].get("t1_neurological", "") for x in p8_qc],
         "qsm_matches_P8": qsm_match,
+        "label_matches_P8": label_match,
+        "t1seg_matches_P8": t1seg_match,
         "qsm_pixdim": [r.get("pixdim", "") for r in results],
         "qsm_voxel_mm3": vox_mm3,
         "qsm_coverage_mm": (sub["qsm_coverage_mm"].to_numpy() if "qsm_coverage_mm" in sub.columns
@@ -756,6 +819,7 @@ def main():
         "csf_ref_ppb": csf_values,
         "csf_voxels": csf_counts,
         "label_voxels_without_qsm_support": (label_counts - counts).sum(axis=1),
+        "n_reportable_rois": n_reportable,
         "n_nan_DK": out[[f"{n}_{primary}" for n in names]].isna().sum(axis=1).to_numpy(),
         "n_low_voxels": [r.get("n_low_voxels", n_keys) for r in results],
         "n_low_coverage": [r.get("n_low_coverage", 0) for r in results],
@@ -815,6 +879,9 @@ def main():
           f"{sum(results[i]['n_low_voxels'] for i in ok_rows)} below --min-voxels {args.min_voxels}/"
           f"--min-mm3 {args.min_mm3:g}, {sum(results[i]['n_low_coverage'] for i in ok_rows)} below "
           f"--min-coverage {args.min_coverage:g}")
+    if ok_rows:
+        print(f"Reportable ROIs per successful extraction: median {np.median(n_reportable[ok_rows]):.0f}, "
+              f"minimum {n_reportable[ok_rows].min()} (--min-reportable-rois {args.min_reportable_rois})")
     if (cortex_iqr < PPM_IQR_SUSPECT).any():
         print(f"  WARNING: {int((cortex_iqr < PPM_IQR_SUSPECT).sum())} subjects have cortical QSM IQR < "
               f"{PPM_IQR_SUSPECT} ppb (possible ppm units; see possible_ppm_units)")

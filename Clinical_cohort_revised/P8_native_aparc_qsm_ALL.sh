@@ -31,7 +31,11 @@ QC="${QC_DIR}/${OUT_ID}_native_qc.txt"
 FINAL="${LABEL_DIR}/${OUT_ID}_aparc_aseg_QSMnative.nii.gz"
 T1SEG="${T1SEG_DIR}/${OUT_ID}_aparc+aseg_T1.nii.gz"
 T1SEG_SRC="${T1SEG_DIR}/${OUT_ID}_t1seg_source.txt"
-GRID_INFO="${MAT_DIR}/${OUT_ID}_grid_conversion.txt"
+MAT_Q2T="${MAT_DIR}/${OUT_ID}_QSM_to_T1.mat"
+MAT_SRC="${MAT_DIR}/${OUT_ID}_QSM_to_T1_source.txt"
+P1_QC="${P1_DIR}/${OUT_ID}_qc_rigid.txt"
+# Grid-conversion and provenance fields of the current build; step [5] copies them into QC.
+BUILD_INFO="${MAT_DIR}/${OUT_ID}_build_info.txt"
 
 exec > >(tee -a "${LOG_DIR}/${OUT_ID}.log") 2>&1
 
@@ -42,14 +46,61 @@ echo "  T1  = $T1"
 echo "  native_root = $NATIVE_ROOT"
 echo "=================================================================="
 
+canon_path() { readlink -f -- "$1" 2>/dev/null || printf '%s\n' "$1"; }
+qc_field() { awk -v k="$1" 'index($0, k "=") == 1 {print substr($0, length(k) + 2); exit}' "$2" 2>/dev/null || true; }
+file_sha1() { sha1sum -- "$1" | awk '{print $1}'; }
+
+for f in "$QSM" "$T1"; do
+    [[ -e "$f" ]] || { echo "ERROR: Missing file $f" >&2; exit 2; }
+done
+QSM_SHA1=$(file_sha1 "$QSM")
+T1_SHA1=$(file_sha1 "$T1")
+
+# An exported FORCE_RERUN=1 still forces P1, as it did when P1 inherited it.
+P1_FORCE="${P8_FORCE_P1:-${FORCE_RERUN:-0}}"
+
+# Print why the existing label cannot be reused for these inputs; no output means it can.
+# A reusable label passed QC with this grid conversion, and the QSM, T1, P1 matrix,
+# segmentation and label are byte-identical to the ones recorded when it was built.
+existing_output_problems() {
+    if [[ "$P1_FORCE" == "1" ]]; then echo "P1 re-registration requested"; fi
+    if [[ "${P8_FORCE_SYNTHSEG:-0}" == "1" ]]; then echo "SynthSeg rerun requested"; fi
+    if [[ ! -s "$QC" ]]; then
+        echo "no QC file"
+        return
+    fi
+    if ! grep -qx "grid_conversion=${GRID_CONVERSION_TAG}" "$QC"; then
+        echo "QC predates grid conversion ${GRID_CONVERSION_TAG}"
+    fi
+    if grep -q '^ERROR:' "$QC"; then echo "QC recorded errors"; fi
+    if [[ "$(canon_path "$(qc_field qsm "$QC")")" != "$(canon_path "$QSM")" ]]; then echo "QSM path differs"; fi
+    if [[ "$(canon_path "$(qc_field t1 "$QC")")" != "$(canon_path "$T1")" ]]; then echo "T1 path differs"; fi
+    if [[ "$(qc_field qsm_sha1 "$QC")" != "$QSM_SHA1" ]]; then echo "QSM content differs or was not recorded"; fi
+    if [[ "$(qc_field t1_sha1 "$QC")" != "$T1_SHA1" ]]; then echo "T1 content differs or was not recorded"; fi
+    if [[ ! -s "$MAT_Q2T" || "$(qc_field q2t_mat_sha1 "$QC")" != "$(file_sha1 "$MAT_Q2T")" ]]; then
+        echo "QSM_to_T1.mat changed since the label was built"
+    fi
+    if [[ ! -s "$T1SEG" || "$(qc_field t1seg_sha1 "$QC")" != "$(file_sha1 "$T1SEG")" ]]; then
+        echo "T1 segmentation changed since the label was built"
+    fi
+    if [[ "$(qc_field t1_sha1 "$T1SEG_SRC")" != "$T1_SHA1" ]]; then
+        echo "T1 segmentation source not verified for this T1"
+    fi
+    if [[ "$(qc_field label_sha1 "$QC")" != "$(file_sha1 "$FINAL")" ]]; then
+        echo "label differs from the one QC checked"
+    fi
+}
+
 if [[ -s "$FINAL" && "${P8_FORCE_RERUN:-0}" != "1" ]]; then
-    if grep -qx "grid_conversion=${GRID_CONVERSION_TAG}" "$QC" 2>/dev/null; then
-        echo "Existing output; skipping: $FINAL"
+    mapfile -t _problems < <(existing_output_problems)
+    if (( ${#_problems[@]} == 0 )); then
+        echo "Existing output verified for these inputs; skipping: $FINAL"
         exit 0
     fi
-    # The P1 registration and SynthSeg output are reused below when still valid,
-    # so regenerating a legacy label only repeats steps [3]-[5].
-    echo "Existing output has no QC or predates grid conversion ${GRID_CONVERSION_TAG}; regenerating"
+    # Verified P1 registrations and SynthSeg outputs are reused below, so regenerating
+    # usually repeats only steps [3]-[5].
+    printf -v _why '%s; ' "${_problems[@]}"
+    echo "Existing output not reused (${_why%; }); regenerating"
 fi
 
 if ! type module >/dev/null 2>&1; then
@@ -83,10 +134,6 @@ if [[ ! -x "$SYNTHSEG" ]]; then
     exit 1
 fi
 
-for f in "$QSM" "$T1"; do
-    [[ -e "$f" ]] || { echo "ERROR: Missing file $f" >&2; exit 2; }
-done
-
 QSM_DT=$(fslinfo "$QSM" | awk '/^datatype/{print $2}')
 if [[ "$QSM_DT" == "128" ]]; then
     echo "ERROR: QSM image is not scalar (datatype=128, RGB); cannot extract QSM" >&2
@@ -118,28 +165,34 @@ fi
 
 # From here on the outputs are regenerated; remove the old QC and label so that a
 # failure below cannot leave a stale passing QC file next to a new or missing label.
-rm -f "$QC" "$FINAL" "$GRID_INFO"
+rm -f "$QC" "$FINAL" "$BUILD_INFO"
 
-MAT_Q2T="${MAT_DIR}/${OUT_ID}_QSM_to_T1.mat"
-P1_QC="${P1_DIR}/${OUT_ID}_qc_rigid.txt"
-
-canon_path() { readlink -f -- "$1" 2>/dev/null || printf '%s\n' "$1"; }
-qc_field() { awk -v k="$1" 'index($0, k "=") == 1 {print substr($0, length(k) + 2); exit}' "$2" 2>/dev/null || true; }
-
-# P1 skips rigid registration whenever QSM_to_T1.mat exists (and then writes no QC), and
-# it reads FORCE_RERUN, not P8_FORCE_RERUN. Reuse the kept matrix only when P1's QC shows
-# it was made from the same QSM and T1; otherwise force P1 to register again. An exported
-# FORCE_RERUN=1 still forces P1, as it did when P1 inherited it.
-P1_FORCE="${P8_FORCE_P1:-${FORCE_RERUN:-0}}"
+# P1 skips rigid registration whenever QSM_to_T1.mat exists (and then writes no QC), and it
+# reads FORCE_RERUN, not P8_FORCE_RERUN. Reuse the kept matrix only when it is known to come
+# from these inputs: by the content hashes recorded when P8 last ran P1 or, for a matrix from
+# before that record existed, by P1's QC paths and inputs no newer than the matrix.
 if [[ "$P1_FORCE" != "1" && -s "$MAT_Q2T" ]]; then
-    if [[ ! -s "$P1_QC" ]]; then
-        echo "  No P1 QC for existing $MAT_Q2T; re-running P1"
+    if [[ -s "$MAT_SRC" ]]; then
+        if [[ "$(qc_field qsm_sha1 "$MAT_SRC")" != "$QSM_SHA1" || \
+                "$(qc_field t1_sha1 "$MAT_SRC")" != "$T1_SHA1" ]]; then
+            echo "  Existing $MAT_Q2T was made from different QSM/T1 content; re-running P1"
+            P1_FORCE=1
+        fi
+    elif [[ ! -s "$P1_QC" ]]; then
+        echo "  No P1 QC or source record for existing $MAT_Q2T; re-running P1"
         P1_FORCE=1
     elif [[ "$(canon_path "$(qc_field QSM "$P1_QC")")" != "$(canon_path "$QSM")" || \
             "$(canon_path "$(qc_field T1 "$P1_QC")")" != "$(canon_path "$T1")" ]]; then
         echo "  Existing $MAT_Q2T was made from different QSM/T1 files; re-running P1"
         P1_FORCE=1
+    elif [[ "$QSM" -nt "$MAT_Q2T" || "$T1" -nt "$MAT_Q2T" ]]; then
+        echo "  QSM/T1 modified after $MAT_Q2T was made; re-running P1"
+        P1_FORCE=1
     fi
+fi
+P1_FRESH=0
+if [[ "$P1_FORCE" == "1" || ! -s "$MAT_Q2T" ]]; then
+    P1_FRESH=1
 fi
 
 echo "[1] Run P1 (STOP_AFTER=rigid, FORCE_RERUN=${P1_FORCE}) to obtain QSM_to_T1.mat ..."
@@ -154,33 +207,36 @@ if [[ ! -s "$MAT_Q2T" ]]; then
     echo "ERROR: P1 did not retain $MAT_Q2T (work-file preservation may have failed)" >&2
     exit 11
 fi
+if [[ "$P1_FRESH" == "1" ]]; then
+    printf 'qsm=%s\nqsm_sha1=%s\nt1=%s\nt1_sha1=%s\n' "$QSM" "$QSM_SHA1" "$T1" "$T1_SHA1" > "$MAT_SRC"
+fi
 
 DICE=$(qc_field reg_mask_dice "$P1_QC")
 
-# Reuse an existing segmentation only when it lies on this T1's grid (--keepgeom) and,
-# if its source was recorded, was made from this T1 file. P8_FORCE_SYNTHSEG=1 reruns it.
+# Reuse an existing segmentation only when its source record shows it was made from a T1
+# with this content, and it lies on this T1's grid (--keepgeom). Matching dimensions and
+# affines alone cannot show that two T1 images are the same scan, so a segmentation without
+# a source record is regenerated. P8_FORCE_SYNTHSEG=1 always reruns SynthSeg.
 REUSE_T1SEG=0
 if [[ -s "$T1SEG" && "${P8_FORCE_SYNTHSEG:-0}" != "1" ]]; then
-    if "$PY310" - "$T1" "$T1SEG" "$T1SEG_SRC" <<'PYEOF'
+    if [[ ! -s "$T1SEG_SRC" ]]; then
+        echo "[2] Existing segmentation has no source record; regenerating it"
+    elif [[ "$(qc_field t1_sha1 "$T1SEG_SRC")" != "$T1_SHA1" ]]; then
+        echo "[2] Existing segmentation was made from a T1 with different content; regenerating it"
+    elif "$PY310" - "$T1" "$T1SEG" <<'PYEOF'
 import sys
-from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 
-t1_p, seg_p, src_p = sys.argv[1:4]
-t1, seg = nib.load(t1_p), nib.load(seg_p)
+t1, seg = nib.load(sys.argv[1]), nib.load(sys.argv[2])
 same_grid = t1.shape[:3] == seg.shape[:3] and np.allclose(t1.affine, seg.affine, atol=1e-3)
-recorded = None
-if Path(src_p).is_file():
-    for line in Path(src_p).read_text(encoding="utf-8").splitlines():
-        if line.startswith("t1="):
-            recorded = line[3:]
-same_source = recorded is None or Path(recorded).resolve() == Path(t1_p).resolve()
-sys.exit(0 if same_grid and same_source else 1)
+sys.exit(0 if same_grid else 1)
 PYEOF
     then
         REUSE_T1SEG=1
+    else
+        echo "[2] Existing segmentation is not on this T1's grid; regenerating it"
     fi
 fi
 
@@ -195,14 +251,14 @@ else
         exit 13
     fi
     [[ -s "$T1SEG" ]] || { echo "ERROR: SynthSeg did not generate $T1SEG" >&2; exit 13; }
-    printf 't1=%s\n' "$T1" > "$T1SEG_SRC"
+    printf 't1=%s\nt1_sha1=%s\n' "$T1" "$T1_SHA1" > "$T1SEG_SRC"
 fi
 
 
 T1_TO_QSM="${MAT_DIR}/${OUT_ID}_T1_to_QSM.mat"
 T1_BRAIN="${MAT_DIR}/${OUT_ID}_T1_brain.nii.gz"
 if [[ -s "$T1_BRAIN" ]]; then
-    "$PY310" - "$HERE" "$T1" "$T1_BRAIN" "$MAT_Q2T" "$T1_TO_QSM" "$GRID_INFO" \
+    "$PY310" - "$HERE" "$T1" "$T1_BRAIN" "$MAT_Q2T" "$T1_TO_QSM" "$BUILD_INFO" \
             "$GRID_CONVERSION_TAG" <<'PYEOF' || exit 12
 import sys
 
@@ -268,9 +324,16 @@ if ! flirt -in "$T1SEG" -ref "$QSM" -applyxfm -init "$T1_TO_QSM" \
 fi
 [[ -s "$FINAL" ]] || { echo "ERROR: FLIRT did not generate $FINAL" >&2; exit 14; }
 
+{
+    printf 'qsm_sha1=%s\nt1_sha1=%s\n' "$QSM_SHA1" "$T1_SHA1"
+    printf 'q2t_mat_sha1=%s\n' "$(file_sha1 "$MAT_Q2T")"
+    printf 't1seg_sha1=%s\n' "$(file_sha1 "$T1SEG")"
+    printf 'label_sha1=%s\n' "$(file_sha1 "$FINAL")"
+} >> "$BUILD_INFO"
+
 echo "[5] QC ..."
 "$PY310" - "$QSM" "$FINAL" "$T1SEG" "$QC" "${QC_DIR}/${OUT_ID}_synthseg_vol.csv" \
-            "$OUT_ID" "$DICE" "$QSM_PIX" "$T1_PIX" "$QSM_DT" "$HERE" "$T1" "$GRID_INFO" <<'PYEOF'
+            "$OUT_ID" "$DICE" "$QSM_PIX" "$T1_PIX" "$QSM_DT" "$HERE" "$T1" "$BUILD_INFO" <<'PYEOF'
 import csv
 import json
 import sys
@@ -280,7 +343,7 @@ import nibabel as nib
 import numpy as np
 
 (qsm_p, lab_p, t1seg_p, qc_p, vol_p,
- oid, dice, qsm_pix, t1_pix, qsm_dt, here, t1_p, grid_info_p) = sys.argv[1:14]
+ oid, dice, qsm_pix, t1_pix, qsm_dt, here, t1_p, build_info_p) = sys.argv[1:14]
 
 # ---- FreeSurfer cortical labels: 34 per hemisphere with --parc, including insula; excluding 1004/2004 ----
 # Previously verified against $FREESURFER_HOME/models/synthseg_parcellation_labels.npy:
@@ -420,8 +483,9 @@ with open(qc_p, "w", encoding="utf-8") as fh:
     fh.write(f"node={__import__('socket').gethostname()}\n")
     fh.write(f"qsm={qsm_p}\n")
     fh.write(f"t1={t1_p}\n")
-    # grid_conversion=<tag>, t1_neurological, grid shifts; P8 and P9 check the tag.
-    fh.write(Path(grid_info_p).read_text(encoding="utf-8"))
+    # Grid-conversion tag and shifts, and content hashes of the inputs, P1 matrix,
+    # segmentation and label; P8 checks them before reusing this label and P9 before using it.
+    fh.write(Path(build_info_p).read_text(encoding="utf-8"))
     fh.write(f"qsm_dim={qsm_img.shape[0]}x{qsm_img.shape[1]}x{qsm_img.shape[2]}\n")
     fh.write(f"qsm_pixdim={qsm_pix}\n")
     fh.write(f"qsm_datatype={qsm_dt}\n")
