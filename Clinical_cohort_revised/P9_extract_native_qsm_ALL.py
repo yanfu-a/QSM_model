@@ -3,7 +3,7 @@
 
 """Extract individualized cortical QSM statistics on the native QSM grid.
 
-Required English worklist headers: image_dir_id, qsm_file.
+Required English worklist headers: image_dir_id, qsm_file, t1_file.
 Optional English worklist headers: runnable (yes/no), hospital_id, model_label,
 include_main_model, category, qsm_coverage_mm.
 Optional ID-list headers: IID or image_dir_id.
@@ -12,15 +12,23 @@ The --which filter uses the exact English column names in that ID list.
 Input files must be migrated to English headers before running this script.
 This script does not translate existing input files or legacy downstream schemas.
 
-A subject enters the analysis set (analysis_pass in *_qc.csv, rows of
-*_analysis.csv) only if extraction succeeded with at least --min-reportable-rois
-reported ROI values, it is not on the P1 failure list, P8 QC passed with a
-numeric registration Dice, its P8 label carries the corrected grid-conversion
-tag, and the QSM file, label and T1 segmentation are the ones P8 used and
-checked. An ROI value is reported only when the ROI has enough valid voxels,
-valid volume (mm3) and coverage of a finite, positive T1-space volume. Worklist
-IDs whose repeated rows disagree (e.g. two hospital_ids or diagnoses) are
-excluded and listed in *_excluded.csv.
+A subject enters the primary (unreferenced) analysis set (analysis_pass in *_qc.csv,
+rows of *_analysis.csv) only if all of the following hold:
+  * extraction succeeded with at least --min-reportable-rois reported ROI values;
+  * it has no P1 failure in a stage the native branch shares (input or QSM->T1 rigid
+    registration); failures confined to T1->MNI registration do not exclude it;
+  * the P8 QC file is complete and passed with a numeric registration Dice, and the
+    label carries the corrected grid-conversion tag (legacy labels are never accepted);
+  * the QSM and T1 (worklist qsm_file and t1_file) and the label and T1 segmentation read
+    here are byte-identical (SHA-1) to the ones P8 recorded;
+  * in support-mask mode, the support mask's provenance record verifies against the
+    current QSM and the mask file.
+CSF referencing (--csf-ref) has its own eligibility flag and never changes analysis_pass.
+An ROI value is reported only when the ROI has enough valid voxels, valid volume (mm3)
+and coverage of a finite, positive T1-space volume. Worklist IDs whose repeated rows
+disagree (e.g. two hospital_ids, diagnoses or input files) are excluded; every excluded
+subject is listed with its reason in *_excluded.csv, and *_run_info.json records the
+command, options, software versions and input hashes of the run.
 
 Formal extraction reads QSM support masks (--support-dir; see make_support_masks.py).
 The nonzero-QSM proxy (--allow-nonzero-proxy) is for diagnostics and sensitivity
@@ -29,9 +37,13 @@ analyses only: its output file names carry _proxy and *_qc.csv records the mode.
 
 import argparse
 import csv
+import datetime
 import hashlib
+import json
 import os
+import platform
 import re
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -50,6 +62,16 @@ DEFAULT_FREESURFER_HOME = Path("/public/software/apps/Freesurfer/8.2.0-1")
 
 DEFAULT_NATIVE_DIR = Path("/cwStorage/nodecw_group/FY_data/QSM_HUASHAN/native_data")
 NATIVE_ROOT = DEFAULT_NATIVE_DIR
+# P1's output directory in its default (MNI) mode; holds <IID>_qc.txt for each P1 run.
+DEFAULT_P1_QC_DIR = Path("/cwStorage/nodecw_group/FY_data/QSM_HUASHAN/roi_work")
+
+SUPPORT_TYPES = ("reconstruction", "estimated_from_qsm")
+
+# Warnings P1 writes to <IID>_qc.txt. A failure involving the QSM input or the QSM->T1 rigid
+# registration also concerns the native branch; the others are confined to T1->MNI
+# registration (FNIRT) or the MNI-space output.
+P1_NATIVE_WARNINGS = ("QSM datatype", "reg_mask_dice")
+P1_MNI_WARNINGS = ("FNIRT", "t1_mni_dice", "mni_brain_coverage", "Output dimensions")
 
 NON_CORTICAL = ("white_matter", "corpus")
 
@@ -100,19 +122,44 @@ def read_labels(path):
 
 
 def read_failed_ids(path):
-    """Read failed subject IDs from the P1 batch list (supports literal backslash-t)."""
+    """Read the P1 batch failure list as {ID: line} (supports literal backslash-t)."""
     if path is None:
-        return set()
+        return {}
     if not Path(path).exists():
         print(f"WARNING: Failure list {path} not found; no subject is excluded as a P1 failure")
-        return set()
-    ids = set()
+        return {}
+    ids = {}
     with open(path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            tokens = line.strip().replace("\\t", "\t").split("\t")[0].split()
+            text = line.strip().replace("\\t", "\t")
+            tokens = text.split("\t")[0].split()
             if tokens:
-                ids.add(tokens[0])
+                ids.setdefault(tokens[0], text)
     return ids
+
+
+def classify_p1_failure(qc_path):
+    """Stage of a P1 (MNI-branch) failure from P1's QC file: (stage, evidence).
+
+    'native' when a warning concerns the QSM input or the QSM->T1 rigid registration that
+    the native branch shares; 'mni_only' when every recognized warning concerns T1->MNI
+    registration or the MNI output; 'unknown' without a QC file or recognized warning.
+    """
+    path = Path(qc_path)
+    if not path.is_file():
+        return "unknown", f"no P1 QC file ({path.name})"
+    warnings = [line.split(":", 1)[1].strip()
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.lstrip().upper().startswith("WARNING:")]
+    native = [w for w in warnings if any(m in w for m in P1_NATIVE_WARNINGS)]
+    mni = [w for w in warnings if any(m in w for m in P1_MNI_WARNINGS)]
+    if native:
+        return "native", "; ".join(native)
+    if mni:
+        return "mni_only", "; ".join(mni)
+    if not warnings:
+        return "unknown", "P1 QC records no failure (failure list may be outdated)"
+    return "unknown", "unrecognized P1 warnings: " + "; ".join(warnings)
 
 
 def read_native_qc(path):
@@ -239,7 +286,7 @@ def resolve_duplicate_ids(wl):
     Row order cannot decide between two hospital_ids or diagnoses for one image
     directory, so such IDs are excluded. Return (worklist, exclusion records).
     """
-    check = [c for c in ("qsm_file",) + META_COLS if c in wl.columns]
+    check = [c for c in ("qsm_file", "t1_file") + META_COLS if c in wl.columns]
     excluded = []
     repeated = wl[wl["image_dir_id"].duplicated(keep=False)]
     for oid, grp in repeated.groupby("image_dir_id", sort=False):
@@ -262,18 +309,35 @@ def file_digest(path, chunk=1 << 20):
     return digest.hexdigest()
 
 
-def same_file(a, b):
-    """True when two paths name the same file or byte-identical copies of it."""
-    if not a or not b:
-        return False
-    a, b = Path(a), Path(b)
-    if os.path.realpath(a) == os.path.realpath(b):
-        return True
-    if not (a.is_file() and b.is_file()):
-        return False
-    if os.path.samefile(a, b):
-        return True
-    return a.stat().st_size == b.stat().st_size and file_digest(a) == file_digest(b)
+def same_path(a, b):
+    """True when two paths resolve to the same location (says nothing about content)."""
+    return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+
+
+def write_csv(df, path):
+    """Write a CSV atomically: a temporary file in the same folder, then a rename."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    df.to_csv(tmp, index=False, encoding="utf-8-sig")
+    os.replace(tmp, path)
+
+
+def support_record_path(mask_path):
+    """<IID>_support.json next to <IID>_support.nii[.gz] (written by make_support_masks.py)."""
+    name = Path(mask_path).name
+    stem = name[:-7] if name.endswith(".nii.gz") else name[:-4] if name.endswith(".nii") else name
+    return Path(mask_path).with_name(stem + ".json")
+
+
+def read_support_record(mask_path):
+    """The support mask's provenance record, {} when absent, or None when unreadable."""
+    path = support_record_path(mask_path)
+    if not path.is_file():
+        return {}
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) else None
 
 
 def to_float(value):
@@ -420,9 +484,9 @@ def native_csf_reference(lab, qsm, valid, min_voxels=30):
 def process_subject(task, keys, opts):
     """Load one subject once; return ROI statistics, T1-space coverage and the CSF reference.
 
-    Content hashes of the label and T1 segmentation are returned for comparison with
-    the ones P8 recorded. Any error becomes the returned status, so one unreadable
-    file cannot stop the cohort run.
+    Content hashes of every input read (QSM, T1, label, T1 segmentation, support mask) are
+    returned for comparison with the provenance P8 and make_support_masks.py recorded.
+    Any error becomes the returned status, so one unreadable file cannot stop the run.
     """
     try:
         lab, qsm, valid, zooms, vox_mm3 = load_native_grid(task["label"], task["qsm"],
@@ -431,9 +495,21 @@ def process_subject(task, keys, opts):
                   else np.full(len(keys), np.nan))
         res = extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, opts["min_voxels"],
                           opts["min_mm3"], opts["min_coverage"])
+        hdr = nib.load(str(task["qsm"])).header
+        nonzero = np.isfinite(qsm) & (qsm != 0)
         res.update(t1_mm3=t1_mm3, vox_mm3=vox_mm3, pixdim="x".join(f"{z:.4g}" for z in zooms),
+                   qsm_sha1=file_digest(task["qsm"]),
+                   t1_sha1=file_digest(task["t1"]),
                    label_sha1=file_digest(task["label"]),
-                   t1seg_sha1=file_digest(task["t1seg"]) if task["t1seg"] is not None else "")
+                   t1seg_sha1=file_digest(task["t1seg"]) if task["t1seg"] is not None else "",
+                   # Reported, never used to rescale: on-disk type, NIfTI scaling, integer values.
+                   qsm_dtype=str(hdr.get_data_dtype()),
+                   qsm_scl_slope=float(hdr["scl_slope"]), qsm_scl_inter=float(hdr["scl_inter"]),
+                   qsm_integer_valued=bool(nonzero.any() and np.all(np.mod(qsm[nonzero], 1) == 0)))
+        if task["support"] is not None:
+            res.update(support_sha1=file_digest(task["support"]),
+                       support_record=read_support_record(task["support"]),
+                       qsm_nonzero_outside_support=int((nonzero & ~valid).sum()))
         if opts["csf_ref"]:
             res["csf_ref"], res["csf_voxels"] = native_csf_reference(lab, qsm, valid,
                                                                      opts["min_csf_voxels"])
@@ -442,12 +518,14 @@ def process_subject(task, keys, opts):
         return {"status": f"ERROR {type(exc).__name__}: {exc}"}
 
 
-def reliability(out, names, label):
-    """Cross-subject left/right homologous ROI correlations and Spearman-Brown coefficient (as in P5).
+def lr_concordance(out, names, label):
+    """Cross-subject left/right homologous ROI correlations and their Spearman-Brown projection.
 
-    Homologous correlations include variance shared by every ROI (QSM reference
-    offset, age, global iron), so the mean correlation of non-homologous
-    left/right pairs is printed as a baseline; only the excess is region-specific.
+    This is anatomical left/right concordance (as in P5), not test-retest reliability:
+    homologous correlations include variance shared by every ROI (QSM reference offset,
+    age, global iron), so the mean correlation of non-homologous left/right pairs is
+    printed as a baseline; only the excess is region-specific. test_retest() uses repeat
+    scans for an actual (if small) reliability estimate.
     """
     pairs = [(c, "R_" + c[2:]) for c in names
              if c.startswith("L_") and "R_" + c[2:] in names]
@@ -465,8 +543,8 @@ def reliability(out, names, label):
     off = block[~np.eye(len(pairs), dtype=bool)]
     off = off[np.isfinite(off)]
     base = float(np.mean(off)) if off.size else float("nan")
-    print(f"\nReliability check ({label}, {len(detail)} left/right homologous ROI pairs): "
-          f"mean r={rbar:.3f}  Spearman-Brown coefficient={sb:.3f}")
+    print(f"\nLeft/right concordance ({label}, {len(detail)} homologous ROI pairs; not test-retest "
+          f"reliability): mean r={rbar:.3f}  Spearman-Brown projection={sb:.3f}")
     print(f"  Non-homologous left/right baseline mean r={base:.3f}; homologous excess={rbar - base:+.3f}")
     print("  Five lowest-correlated pairs:",
           ", ".join(f"{n}={r:.2f}" for n, r in sorted(detail, key=lambda t: t[1])[:5]))
@@ -514,10 +592,14 @@ def main():
     ap.add_argument("--allow-label-name-mismatch", action="store_true",
                     help="Continue when CSV region names differ from the FreeSurfer regions assigned by ID "
                          "(only after checking the printed table)")
-    ap.add_argument("--failed-list", type=Path, default=HERE / "failed_ID.txt")
+    ap.add_argument("--failed-list", type=Path, default=HERE / "failed_ID.txt",
+                    help="P1 batch failure list; each entry is classified by --p1-qc-dir evidence")
+    ap.add_argument("--p1-qc-dir", type=Path, default=DEFAULT_P1_QC_DIR,
+                    help="P1 output directory holding <IID>_qc.txt; a failure confined to T1->MNI "
+                         "registration does not exclude a subject from the native analysis")
     ap.add_argument("--include-failed", action="store_true",
-                    help="Also extract subjects from the failure list (diagnostics only; "
-                         "they never enter the analysis set)")
+                    help="Also extract failure-list subjects whose failure involves the native branch "
+                         "or has no stage evidence (diagnostics only; they never enter the analysis set)")
     ap.add_argument("--ids-file", type=Path, default=None,
                     help="Process only subjects in this list (e.g., pilot_native.csv)")
     ap.add_argument("--sample-root", type=Path, default=None,
@@ -540,9 +622,6 @@ def main():
     ap.add_argument("--min-reportable-rois", type=int, default=1,
                     help="Minimum ROIs with a reported value for a subject to enter the analysis set "
                          "(68 keeps complete cases only, for models that need every ROI)")
-    ap.add_argument("--allow-legacy-labels", action="store_true",
-                    help="Accept P8 labels built before the grid-conversion fix (only for subjects that "
-                         "check_grid_conversion.py reports as unaffected)")
     ap.add_argument("--csf-ref", action="store_true",
                     help="Also save cortical values referenced to each subject's lateral-ventricle CSF median")
     ap.add_argument("--min-csf-voxels", type=int, default=30)
@@ -581,7 +660,7 @@ def main():
     keys = sorted(fs_to_name)
     names = [fs_to_name[k] for k in keys]
     mapping_path = args.out_dir / f"native_label_mapping{sfx}.csv"
-    pd.DataFrame(mapping_rows).to_csv(mapping_path, index=False, encoding="utf-8-sig")
+    write_csv(pd.DataFrame(mapping_rows), mapping_path)
     print(f"Cortical label mapping OK: {len(keys)} regions (34 per hemisphere, including insula; "
           f"{INSULA_L}/{INSULA_R} in {args.labels.name} has no corresponding CSV entry and is added in this branch); "
           f"names checked against the FreeSurfer LUT ({mapping_path.name})")
@@ -590,23 +669,41 @@ def main():
     # Worklist input headers must be English; no legacy-language aliases are used.
     if "image_dir_id" not in wl.columns and "IID" in wl.columns:
         wl["image_dir_id"] = wl["IID"]
-    required = {"image_dir_id", "qsm_file"}
+    # t1_file is needed to verify that P8 segmented the T1 the worklist names.
+    required = {"image_dir_id", "qsm_file", "t1_file"}
     absent = sorted(required - set(wl.columns))
     if absent:
         raise SystemExit(f"Missing worklist columns: {absent}. Rename input headers to English.")
+    excluded = []
     if "runnable" in wl.columns:
-        wl = wl[wl["runnable"].str.strip().str.lower() == "yes"]
-    wl, excluded = resolve_duplicate_ids(wl)
-    failed = read_failed_ids(args.failed_list)
-    on_failed = wl["image_dir_id"].isin(failed)
-    if args.include_failed:
-        print(f"Included failed-list IDs (diagnostic mode; never in the analysis set): "
-              f"{int(on_failed.sum())} subjects")
-    else:
-        excluded += [{"IID": oid, "reason": "on P1 failure list"}
-                     for oid in wl.loc[on_failed, "image_dir_id"]]
-        wl = wl[~on_failed]
+        runnable = wl["runnable"].str.strip().str.lower() == "yes"
+        excluded += [{"IID": oid, "reason": f"worklist runnable={value!r}"}
+                     for oid, value in zip(wl.loc[~runnable, "image_dir_id"], wl.loc[~runnable, "runnable"])]
+        wl = wl[runnable]
+    wl, conflicts = resolve_duplicate_ids(wl)
+    excluded += conflicts
 
+    # The P1 failure list mixes stages. A failure in a stage the native branch shares (QSM
+    # input, QSM->T1 rigid registration) excludes the subject, as does an entry without stage
+    # evidence; a failure confined to T1->MNI registration (FNIRT) or the MNI output does not.
+    failed = read_failed_ids(args.failed_list)
+    p1_stage = {oid: classify_p1_failure(args.p1_qc_dir / f"{oid}_qc.txt")
+                for oid in wl["image_dir_id"] if oid in failed}
+    blocking = {oid for oid, (stage, _) in p1_stage.items() if stage != "mni_only"}
+    if p1_stage:
+        stages = Counter(stage for stage, _ in p1_stage.values())
+        print(f"P1 failure-list entries in the worklist: {len(p1_stage)} "
+              f"({', '.join(f'{k} {v}' for k, v in sorted(stages.items()))}); "
+              f"mni_only entries stay in the native analysis")
+    if args.include_failed:
+        print(f"Included failure-list IDs involving the native branch or without stage evidence "
+              f"(diagnostic mode; never in the analysis set): {len(blocking)} subjects")
+    else:
+        excluded += [{"IID": oid, "reason": f"P1 failure (stage {p1_stage[oid][0]}): {p1_stage[oid][1]}"}
+                     for oid in wl["image_dir_id"] if oid in blocking]
+        wl = wl[~wl["image_dir_id"].isin(blocking)]
+
+    selection = None                    # IDs chosen by --sample-root / --ids-file, if any
     if args.sample_root:
         if not args.sample_root.is_dir():
             raise SystemExit(f"Sample directory does not exist: {args.sample_root}")
@@ -614,6 +711,7 @@ def main():
         if not sample_ids:
             raise SystemExit(f"No subject subdirectories in sample root: {args.sample_root}")
         wl = wl[wl["image_dir_id"].isin(sample_ids)]
+        selection = set(sample_ids)
         print(f"Filtered by sample root: {len(wl)} subjects")
 
     if args.ids_file:
@@ -628,15 +726,18 @@ def main():
                                  f"got {args.which!r}")
             p = p[p[k] == v]
         wl = wl[wl["image_dir_id"].isin(p[idcol])]
+        selection = set(p[idcol]) if selection is None else selection & set(p[idcol])
         print(f"Filtered by ID list: {len(wl)} subjects")
 
     qsm_of = dict(zip(wl["image_dir_id"], wl["qsm_file"]))
+    t1_of = dict(zip(wl["image_dir_id"], wl["t1_file"]))
     meta = wl.set_index("image_dir_id")
 
     ids, tasks = [], []
     for oid in wl["image_dir_id"]:
         lab = label_dir / f"{oid}_aparc_aseg_QSMnative.nii.gz"
         qsm = Path(qsm_of.get(oid, ""))
+        t1 = Path(t1_of.get(oid, ""))
         if args.sample_root:
             sample_dir = args.sample_root / oid
             qsm_candidates = [p for p in sample_dir.glob("*.nii*")
@@ -647,33 +748,64 @@ def main():
                 excluded.append({"IID": oid, "reason": f"sample directory has QSM={len(qsm_candidates)}, "
                                                        f"T1={len(t1_candidates)} candidates"})
                 continue
-            qsm = qsm_candidates[0]
+            qsm, t1 = qsm_candidates[0], t1_candidates[0]
         support = None
         if args.support_dir:
             support_candidates = [args.support_dir / f"{oid}_support.nii.gz",
                                   args.support_dir / f"{oid}_support.nii"]
             support = next((p for p in support_candidates if p.is_file()), None)
-            if support is None:
-                excluded.append({"IID": oid, "reason": "support mask missing"})
-                continue
         t1seg = t1seg_dir / f"{oid}_aparc+aseg_T1.nii.gz"
+        # The first missing input in pipeline order is reported, so the reason names the cause.
         if not (lab.is_file() and lab.stat().st_size > 0):
             excluded.append({"IID": oid, "reason": "P8 native label missing"})
         elif not qsm.is_file():
             excluded.append({"IID": oid, "reason": f"QSM file missing: {qsm}"})
+        elif not t1.is_file():
+            excluded.append({"IID": oid, "reason": f"T1 file missing (needed to verify P8's T1): {t1}"})
+        elif args.support_dir and support is None:
+            excluded.append({"IID": oid, "reason": "support mask missing"})
         elif args.min_coverage > 0 and not t1seg.is_file():
             excluded.append({"IID": oid, "reason": "P8 T1 segmentation missing (needed for --min-coverage)"})
         else:
             ids.append(oid)
-            tasks.append({"label": lab, "qsm": qsm, "support": support,
+            tasks.append({"label": lab, "qsm": qsm, "t1": t1, "support": support,
                           "t1seg": t1seg if t1seg.is_file() else None})
+    if selection is not None:
+        # Worklist-level exclusions were recorded before the selection; keep the selected subjects'.
+        excluded = [e for e in excluded if e["IID"] in selection]
     excluded_path = out_path("_excluded.csv")
-    pd.DataFrame(excluded, columns=["IID", "reason"]).to_csv(excluded_path, index=False,
-                                                              encoding="utf-8-sig")
+    write_csv(pd.DataFrame(excluded, columns=["IID", "reason"]), excluded_path)
     print(f"\nSubjects with native labels: {len(ids)}; excluded or incomplete: {len(excluded)}"
           + (f" (first 10: {[e['IID'] for e in excluded[:10]]}; all in {excluded_path.name})"
              if excluded else ""))
+
+    def write_run_info(counts):
+        """Record what produced these outputs, so analysis_pass can be reproduced and audited."""
+        def described(path):
+            path = Path(path) if path else None
+            return ({"path": str(path), "sha1": file_digest(path)} if path is not None and path.is_file()
+                    else {"path": str(path) if path else None, "sha1": None})
+        info = {
+            "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "command": sys.argv,
+            "coverage_mode": coverage_mode,
+            "options": {k: (str(v) if isinstance(v, Path) else v) for k, v in sorted(vars(args).items())},
+            "scripts": {"P9_extract_native_qsm_ALL.py": file_digest(Path(__file__))},
+            "inputs": {"worklist": described(args.worklist), "labels": described(args.labels),
+                       "freesurfer_lut": described(args.freesurfer_home / "FreeSurferColorLUT.txt"),
+                       "failed_list": described(args.failed_list)},
+            "grid_conversion_tag": GRID_CONVERSION_TAG,
+            "versions": {"python": platform.python_version(), "numpy": np.__version__,
+                         "nibabel": nib.__version__, "pandas": pd.__version__},
+            "counts": counts,
+        }
+        path = out_path("_run_info.json")
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps(info, indent=1) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+
     if not ids:
+        write_run_info({"extracted": 0, "excluded": len(excluded), "analysis_pass": 0})
         raise SystemExit("No eligible subjects. Complete P8 first.")
 
     opts = {"min_voxels": args.min_voxels, "min_mm3": args.min_mm3,
@@ -718,103 +850,160 @@ def main():
     out = pd.concat([meta_out, roi_out], axis=1)
 
     csv_path = out_path(".csv")
-    out.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    write_csv(out, csv_path)
 
     csf_values = np.array([r.get("csf_ref", np.nan) for r in results], dtype=float)
     csf_counts = np.array([r.get("csf_voxels", 0) for r in results], dtype=np.int64)
 
     # ---------- Analysis set ----------
+    # Each file read in this run is compared by content (SHA-1) with the provenance P8 and
+    # make_support_masks.py recorded; an unchanged path alone is never accepted.
     p8_qc = [read_native_qc(qc_dir / f"{oid}_native_qc.txt") for oid in ids]
     p1_failed = np.asarray([oid in failed for oid in ids], dtype=bool)
     p8_dice = np.array([to_float(f.get("reg_mask_dice")) for _, _, f in p8_qc])
     grid_ok = np.array([f.get("grid_conversion") == GRID_CONVERSION_TAG for _, _, f in p8_qc])
-    qsm_match = np.array([same_file(t["qsm"], f.get("qsm", ""))
-                          for t, (_, _, f) in zip(tasks, p8_qc)])
 
     def matches_p8(key, field):
         """True/False when both the file hash and P8's record exist, else None."""
         return [None if not (r.get(key) and f.get(field)) else r[key] == f[field]
                 for r, (_, _, f) in zip(results, p8_qc)]
 
+    qsm_match = matches_p8("qsm_sha1", "qsm_sha1")
+    t1_match = matches_p8("t1_sha1", "t1_sha1")
     label_match = matches_p8("label_sha1", "label_sha1")
     t1seg_match = matches_p8("t1seg_sha1", "t1seg_sha1")
+    qsm_path_match = [same_path(t["qsm"], f.get("qsm", "")) for t, (_, _, f) in zip(tasks, p8_qc)]
+    t1_path_match = [same_path(t["t1"], f.get("t1", "")) for t, (_, _, f) in zip(tasks, p8_qc)]
     n_reportable = np.array([r.get("n_reportable", 0) for r in results], dtype=int)
-    fail_reasons = []
+
+    def support_problem(res):
+        """Why the support mask cannot be used with this QSM, or '' when its record verifies."""
+        record = res.get("support_record")
+        if record is None:
+            return "support mask provenance record unreadable"
+        if not record:
+            return "support mask has no provenance record (rebuild it with make_support_masks.py)"
+        if record.get("support_type") not in SUPPORT_TYPES:
+            return f"support mask has unknown support_type {record.get('support_type')!r}"
+        if record.get("qsm_sha1") != res.get("qsm_sha1"):
+            return "support mask was built from a different QSM"
+        if record.get("mask_sha1") != res.get("support_sha1"):
+            return "support mask file differs from its provenance record"
+        return ""
+
+    fail_reasons, support_ok = [], []
     for i in range(n_sub):
         why = []
+        res, (qc_status, _, fields) = results[i], p8_qc[i]
         if status[i] != "OK":
             why.append(f"extraction: {status[i]}")
-        if p1_failed[i]:
-            why.append("on P1 failure list")
-        if p8_qc[i][0] == "missing":
+        if ids[i] in blocking:          # present only with --include-failed
+            stage, evidence = p1_stage[ids[i]]
+            why.append(f"P1 failure (stage {stage}): {evidence}")
+        if qc_status == "missing":
             why.append("P8 QC missing")
         else:
-            if p8_qc[i][0] != "pass":
+            if fields.get("qc_complete") != "1":
+                why.append("P8 QC incomplete")
+            if qc_status != "pass":
                 why.append("P8 QC failed")
             if not np.isfinite(p8_dice[i]):
                 why.append("P8 reg_mask_dice missing")
-            if not grid_ok[i] and not args.allow_legacy_labels:
-                why.append("P8 label predates grid-conversion fix")
-            if not qsm_match[i]:
-                why.append("QSM differs from the file P8 used")
-            # The QC verdict and the coverage denominators must belong to the files read here.
-            if label_match[i] is False:
-                why.append("label differs from the one P8 QC checked")
-            elif label_match[i] is None and "label_sha1" not in p8_qc[i][2] and not args.allow_legacy_labels:
-                why.append("P8 QC has no label provenance")
+            if not grid_ok[i]:
+                why.append("P8 label predates grid-conversion fix (rerun P8)")
+            checks = [("qsm_sha1", qsm_match[i], "QSM content differs from the file P8 used", "QSM"),
+                      ("t1_sha1", t1_match[i], "T1 content differs from the file P8 segmented", "T1"),
+                      ("label_sha1", label_match[i], "label differs from the one P8 QC checked", "label")]
             if args.min_coverage > 0:
-                if t1seg_match[i] is False:
-                    why.append("T1 segmentation differs from the one P8 used")
-                elif (t1seg_match[i] is None and "t1seg_sha1" not in p8_qc[i][2]
-                      and not args.allow_legacy_labels):
-                    why.append("P8 QC has no segmentation provenance")
+                checks.append(("t1seg_sha1", t1seg_match[i], "T1 segmentation differs from the one P8 used",
+                               "segmentation"))
+            for field, match, mismatch, what in checks:
+                if match is False:
+                    why.append(mismatch)
+                elif field not in fields:
+                    why.append(f"P8 QC has no {what} provenance")
+        problem = ""
+        if tasks[i]["support"] is not None and "qsm_sha1" in res:
+            problem = support_problem(res)
+            if problem:
+                why.append(problem)
+        support_ok.append(None if tasks[i]["support"] is None or "qsm_sha1" not in res else not problem)
         if status[i] == "OK" and n_reportable[i] < args.min_reportable_rois:
             why.append(f"{n_reportable[i]} reportable ROIs < --min-reportable-rois {args.min_reportable_rois}")
-        if args.csf_ref and not np.isfinite(csf_values[i]):
-            why.append("CSF reference unavailable")
         fail_reasons.append("; ".join(why))
     analysis_pass = np.array([not w for w in fail_reasons], dtype=bool)
+    # CSF referencing has its own eligibility flag; it never changes the primary analysis set.
+    csfref_pass = analysis_pass & np.isfinite(csf_values) if args.csf_ref else np.zeros(n_sub, dtype=bool)
 
     analysis_path = out_path("_analysis.csv")
-    out.loc[analysis_pass].to_csv(analysis_path, index=False, encoding="utf-8-sig")
+    write_csv(out.loc[analysis_pass], analysis_path)
 
     if args.csf_ref:
         ref_roi = roi_out.subtract(csf_values, axis=0)
         ref_out = pd.concat([meta_out, ref_roi], axis=1)
         ref_path = out_path("_csfref.csv")
-        ref_out.to_csv(ref_path, index=False, encoding="utf-8-sig")
-        ref_out.loc[analysis_pass].to_csv(out_path("_csfref_analysis.csv"), index=False,
-                                          encoding="utf-8-sig")
-        print(f"CSF-referenced results: {ref_path}")
+        write_csv(ref_out, ref_path)
+        write_csv(ref_out.loc[csfref_pass], out_path("_csfref_analysis.csv"))
+        print(f"CSF-referenced results: {ref_path} ({int(csfref_pass.sum())} of {int(analysis_pass.sum())} "
+              "analysis-set subjects have a CSF reference)")
 
+    qsm_label_mm3 = label_counts * vox_mm3[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fov_fraction = qsm_label_mm3 / t1_mm3
+    finite_fov = np.where(np.isfinite(fov_fraction), fov_fraction, -np.inf).max(axis=1)
     hosp = (meta_out["hospital_id"] if "hospital_id" in meta_out.columns
             else pd.Series([""] * n_sub))
     repeat_patient = (hosp.ne("") & hosp.duplicated(keep=False)).to_numpy()
     cortex_iqr = np.array([r.get("cortex_iqr", np.nan) for r in results], dtype=float)
-    pd.DataFrame({
+    records = [r.get("support_record") or {} for r in results]
+    qc_out = pd.DataFrame({
         "IID": ids,
         "analysis_pass": analysis_pass,
         "fail_reasons": fail_reasons,
+        "csfref_analysis_pass": csfref_pass if args.csf_ref else [""] * n_sub,
         "coverage_mode": coverage_mode,
         "support_mask": [str(t["support"] or "") for t in tasks],
+        "support_type": [rec.get("support_type", "") for rec in records],
+        "support_method": [rec.get("method", "") for rec in records],
+        "support_max_hole_mm3": [rec.get("max_hole_mm3", "") for rec in records],
+        "support_provenance_ok": support_ok,
+        "qsm_nonzero_outside_support": [r.get("qsm_nonzero_outside_support", "") for r in results],
         "extract_status": status,
         "extract_detail": ["" if s == "OK" else s for s in status],
         "P1_failed_list": p1_failed,
+        "P1_failure_stage": [p1_stage.get(oid, ("", ""))[0] for oid in ids],
+        "P1_failure_evidence": [p1_stage.get(oid, ("", ""))[1] for oid in ids],
         "P8_native_qc_status": [x[0] for x in p8_qc],
         "P8_native_qc_errors": [x[1] for x in p8_qc],
+        "P8_qc_complete": [x[2].get("qc_complete", "") == "1" for x in p8_qc],
         "P8_reg_mask_dice": p8_dice,
         "P8_seg_qsm_dice": [x[2].get("seg_qsm_dice", "") for x in p8_qc],
         "P8_gm_wm_contrast_ppb": [x[2].get("gm_wm_contrast_ppb", "") for x in p8_qc],
         "P8_ribbon_in_qsm_frac": [x[2].get("ribbon_in_qsm_frac", "") for x in p8_qc],
+        "P8_cortex_vol_ml": [x[2].get("cortex_vol_ml", "") for x in p8_qc],
+        "P8_synthseg_icv_ml": [x[2].get("synthseg_icv_ml", "") for x in p8_qc],
         "P8_grid_conversion": [x[2].get("grid_conversion", "") for x in p8_qc],
         "P8_t1_neurological": [x[2].get("t1_neurological", "") for x in p8_qc],
+        "P8_p1_matrix_provenance": [x[2].get("p1_matrix_provenance", "") for x in p8_qc],
+        "P8_q2t_scale_dev": [x[2].get("q2t_scale_dev", "") for x in p8_qc],
+        "P8_qsm_pixdim_sform_rel_diff": [x[2].get("qsm_pixdim_sform_rel_diff", "") for x in p8_qc],
+        "P8_t1_pixdim_sform_rel_diff": [x[2].get("t1_pixdim_sform_rel_diff", "") for x in p8_qc],
         "qsm_matches_P8": qsm_match,
+        "qsm_path_matches_P8": qsm_path_match,
+        "t1_matches_P8": t1_match,
+        "t1_path_matches_P8": t1_path_match,
         "label_matches_P8": label_match,
         "t1seg_matches_P8": t1seg_match,
         "qsm_pixdim": [r.get("pixdim", "") for r in results],
         "qsm_voxel_mm3": vox_mm3,
+        "qsm_dtype": [r.get("qsm_dtype", "") for r in results],
+        "qsm_scl_slope": [r.get("qsm_scl_slope", "") for r in results],
+        "qsm_scl_inter": [r.get("qsm_scl_inter", "") for r in results],
+        "qsm_integer_valued": [r.get("qsm_integer_valued", "") for r in results],
         "qsm_coverage_mm": (sub["qsm_coverage_mm"].to_numpy() if "qsm_coverage_mm" in sub.columns
                             else [""] * n_sub),
+        "t1_cortex_ml": np.where(np.isfinite(t1_mm3).any(axis=1), np.nansum(t1_mm3, axis=1) / 1000.0, np.nan),
+        "max_fov_fraction": np.where(np.isfinite(finite_fov), finite_fov, np.nan),
         "repeat_patient": repeat_patient,
         "csf_ref_ppb": csf_values,
         "csf_voxels": csf_counts,
@@ -825,25 +1014,22 @@ def main():
         "n_low_coverage": [r.get("n_low_coverage", 0) for r in results],
         "cortex_valid_iqr": cortex_iqr,
         "possible_ppm_units": cortex_iqr < PPM_IQR_SUSPECT,
-    }).to_csv(out_path("_qc.csv"), index=False, encoding="utf-8-sig")
+    })
+    write_csv(qc_out, out_path("_qc.csv"))
 
     used = counts.sum(axis=0)
     atlas_voxels = label_counts.sum(axis=0)
-    pd.DataFrame({
+    write_csv(pd.DataFrame({
         "ROI": names,
         "atlas_label_voxels": atlas_voxels,
         "used_qsm_voxels": used,
         "excluded_cerebellar_voxel_fraction": 0.0,
-    }).to_csv(args.out_dir / f"native_mask_voxel_counts{sfx}.csv", index=False,
-              encoding="utf-8-sig")
+    }), args.out_dir / f"native_mask_voxel_counts{sfx}.csv")
 
     sizes = label_counts.astype(float)
     cov = np.divide(counts, sizes, out=np.zeros(counts.shape), where=sizes > 0)
-    qsm_label_mm3 = label_counts * vox_mm3[:, None]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        fov_fraction = qsm_label_mm3 / t1_mm3
     reported = medians if primary == "med" else means
-    pd.DataFrame({
+    write_csv(pd.DataFrame({
         "IID": np.repeat(ids, n_keys),
         "ROI": np.tile(names, n_sub),
         "atlas_label_voxels": label_counts.ravel(),
@@ -857,8 +1043,11 @@ def main():
         "fov_fraction": fov_fraction.ravel().round(4),
         "coverage_vs_t1": coverage.ravel().round(4),
         "roi_value_reported": np.isfinite(reported).ravel(),
-    }).to_csv(args.out_dir / f"native_roi_coverage{sfx}.csv", index=False,
-              encoding="utf-8-sig")
+    }), args.out_dir / f"native_roi_coverage{sfx}.csv")
+    write_run_info({"extracted": n_sub, "excluded": len(excluded),
+                    "extraction_ok": sum(1 for s in status if s == "OK"),
+                    "analysis_pass": int(analysis_pass.sum()),
+                    "csfref_analysis_pass": int(csfref_pass.sum()) if args.csf_ref else None})
 
     n_ok = sum(1 for s in status if s == "OK")
     print(f"QC-passing subjects for downstream analysis: {int(analysis_pass.sum())}/{n_sub} "
@@ -867,8 +1056,6 @@ def main():
                     for reasons in fail_reasons for w in reasons.split("; ") if w)
     for reason, k in tally.most_common():
         print(f"  {k:5d}  {reason}")
-    if args.allow_legacy_labels and not grid_ok.all():
-        print(f"  WARNING: {int((~grid_ok).sum())} legacy P8 labels accepted (--allow-legacy-labels)")
     print(f"\nCompleted: {csv_path}  ({out.shape[0]} subjects x {len(names)} regions, "
           f"successful extractions: {n_ok}/{n_sub})")
     if n_sub - n_ok:
@@ -909,11 +1096,11 @@ def main():
         for st, label in (("med", "native"), ("mean", "native (mean statistic)")):
             if st in stats:
                 renamed = analysis_out.rename(columns={f"{n}_{st}": n for n in names})
-                reliability(renamed, names, label)
+                lr_concordance(renamed, names, label)
                 test_retest(renamed, names, label)
         if args.csf_ref:
-            reliability(ref_out.loc[analysis_pass].rename(columns={f"{n}_{primary}": n for n in names}),
-                        names, "native, CSF-referenced")
+            lr_concordance(ref_out.loc[csfref_pass].rename(columns={f"{n}_{primary}": n for n in names}),
+                           names, "native, CSF-referenced")
 
     if excluded:
         print(f"\nExcluded or incomplete: {len(excluded)} subjects (first 10): "

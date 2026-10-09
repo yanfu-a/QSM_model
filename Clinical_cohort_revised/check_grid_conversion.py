@@ -10,8 +10,9 @@ one T1 voxel along the first voxel axis. For each worklist subject with a kept
 T1_brain, this script compares the original and corrected conversions (image
 headers only) and, when T1_to_QSM.mat exists, identifies which one produced it.
 
-The revised P8 regenerates untagged labels automatically; this audit tells you
-how many existing labels, and any results derived from them, were affected.
+The revised P8 regenerates untagged labels automatically, and P9 never accepts them;
+this audit tells you how many existing labels, and any results derived from them
+(including historical outputs of the original pipeline), were affected.
 """
 
 import argparse
@@ -33,9 +34,20 @@ def fmt(vec):
     return "x".join(f"{round(v, 4) + 0.0:.4f}" for v in vec)
 
 
-def audit_subject(oid, t1_path, mat_dir):
+def qc_grid_tag(qc_path):
+    """grid_conversion= value of a P8 QC file ('' when absent: a legacy label or no QC)."""
+    if not Path(qc_path).is_file():
+        return ""
+    for line in Path(qc_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("grid_conversion="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def audit_subject(oid, t1_path, mat_dir, qc_dir):
     """One audit row for a subject."""
-    row = {"IID": oid, "t1_file": t1_path}
+    row = {"IID": oid, "t1_file": t1_path,
+           "p8_qc_grid_conversion": qc_grid_tag(qc_dir / f"{oid}_native_qc.txt")}
     brain = mat_dir / f"{oid}_T1_brain.nii.gz"
     if not brain.is_file():
         return {**row, "status": "no kept T1_brain"}
@@ -81,7 +93,7 @@ def main():
     rows = []
     for oid, t1 in zip(wl["image_dir_id"], wl["t1_file"]):
         try:
-            rows.append(audit_subject(oid, t1, mat_dir))
+            rows.append(audit_subject(oid, t1, mat_dir, args.native_dir / "qc"))
         except Exception as exc:                                   # noqa: BLE001
             rows.append({"IID": oid, "t1_file": t1, "status": f"ERROR {type(exc).__name__}: {exc}"})
     audit = pd.DataFrame(rows)

@@ -33,6 +33,7 @@ T1SEG="${T1SEG_DIR}/${OUT_ID}_aparc+aseg_T1.nii.gz"
 T1SEG_SRC="${T1SEG_DIR}/${OUT_ID}_t1seg_source.txt"
 MAT_Q2T="${MAT_DIR}/${OUT_ID}_QSM_to_T1.mat"
 MAT_SRC="${MAT_DIR}/${OUT_ID}_QSM_to_T1_source.txt"
+T1_BRAIN="${MAT_DIR}/${OUT_ID}_T1_brain.nii.gz"
 P1_QC="${P1_DIR}/${OUT_ID}_qc_rigid.txt"
 # Grid-conversion and provenance fields of the current build; step [5] copies them into QC.
 BUILD_INFO="${MAT_DIR}/${OUT_ID}_build_info.txt"
@@ -45,6 +46,18 @@ echo "  QSM = $QSM"
 echo "  T1  = $T1"
 echo "  native_root = $NATIVE_ROOT"
 echo "=================================================================="
+
+# One P8 run per subject at a time. Duplicate worklist rows or resubmitted jobs would
+# otherwise rebuild the same files concurrently (P1 also uses one work directory per ID).
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"${LOG_DIR}/${OUT_ID}.lock"
+    if ! flock -n 9; then
+        echo "ERROR: Another P8 run for ${OUT_ID} holds ${LOG_DIR}/${OUT_ID}.lock; not starting a concurrent run" >&2
+        exit 16
+    fi
+else
+    echo "WARNING: flock not found; concurrent P8 runs for ${OUT_ID} are not prevented" >&2
+fi
 
 canon_path() { readlink -f -- "$1" 2>/dev/null || printf '%s\n' "$1"; }
 qc_field() { awk -v k="$1" 'index($0, k "=") == 1 {print substr($0, length(k) + 2); exit}' "$2" 2>/dev/null || true; }
@@ -69,6 +82,7 @@ existing_output_problems() {
         echo "no QC file"
         return
     fi
+    if ! grep -qx "qc_complete=1" "$QC"; then echo "QC file incomplete"; fi
     if ! grep -qx "grid_conversion=${GRID_CONVERSION_TAG}" "$QC"; then
         echo "QC predates grid conversion ${GRID_CONVERSION_TAG}"
     fi
@@ -83,7 +97,8 @@ existing_output_problems() {
     if [[ ! -s "$T1SEG" || "$(qc_field t1seg_sha1 "$QC")" != "$(file_sha1 "$T1SEG")" ]]; then
         echo "T1 segmentation changed since the label was built"
     fi
-    if [[ "$(qc_field t1_sha1 "$T1SEG_SRC")" != "$T1_SHA1" ]]; then
+    if [[ "$(qc_field t1_sha1 "$T1SEG_SRC")" != "$T1_SHA1" || \
+            "$(qc_field t1seg_sha1 "$T1SEG_SRC")" != "$(qc_field t1seg_sha1 "$QC")" ]]; then
         echo "T1 segmentation source not verified for this T1"
     fi
     if [[ "$(qc_field label_sha1 "$QC")" != "$(file_sha1 "$FINAL")" ]]; then
@@ -169,14 +184,23 @@ rm -f "$QC" "$FINAL" "$BUILD_INFO"
 
 # P1 skips rigid registration whenever QSM_to_T1.mat exists (and then writes no QC), and it
 # reads FORCE_RERUN, not P8_FORCE_RERUN. Reuse the kept matrix only when it is known to come
-# from these inputs: by the content hashes recorded when P8 last ran P1 or, for a matrix from
-# before that record existed, by P1's QC paths and inputs no newer than the matrix.
+# from these inputs: by the source record P8 wrote when it last ran P1 (input hashes, plus
+# hashes of the matrix, T1_brain and P1 QC it produced) or, for a matrix from before that
+# record existed, by P1's QC paths and inputs no newer than the matrix.
+P1_PROVENANCE=fresh
 if [[ "$P1_FORCE" != "1" && -s "$MAT_Q2T" ]]; then
     if [[ -s "$MAT_SRC" ]]; then
         if [[ "$(qc_field qsm_sha1 "$MAT_SRC")" != "$QSM_SHA1" || \
                 "$(qc_field t1_sha1 "$MAT_SRC")" != "$T1_SHA1" ]]; then
             echo "  Existing $MAT_Q2T was made from different QSM/T1 content; re-running P1"
             P1_FORCE=1
+        elif [[ "$(qc_field q2t_mat_sha1 "$MAT_SRC")" != "$(file_sha1 "$MAT_Q2T")" || \
+                ! -s "$T1_BRAIN" || "$(qc_field t1_brain_sha1 "$MAT_SRC")" != "$(file_sha1 "$T1_BRAIN")" || \
+                ! -s "$P1_QC" || "$(qc_field p1_qc_sha1 "$MAT_SRC")" != "$(file_sha1 "$P1_QC")" ]]; then
+            echo "  Matrix, T1_brain or P1 QC changed since P8 recorded them; re-running P1"
+            P1_FORCE=1
+        else
+            P1_PROVENANCE=sha1_record
         fi
     elif [[ ! -s "$P1_QC" ]]; then
         echo "  No P1 QC or source record for existing $MAT_Q2T; re-running P1"
@@ -188,11 +212,16 @@ if [[ "$P1_FORCE" != "1" && -s "$MAT_Q2T" ]]; then
     elif [[ "$QSM" -nt "$MAT_Q2T" || "$T1" -nt "$MAT_Q2T" ]]; then
         echo "  QSM/T1 modified after $MAT_Q2T was made; re-running P1"
         P1_FORCE=1
+    else
+        P1_PROVENANCE=legacy_path_mtime
     fi
 fi
 P1_FRESH=0
 if [[ "$P1_FORCE" == "1" || ! -s "$MAT_Q2T" ]]; then
     P1_FRESH=1
+    P1_PROVENANCE=fresh
+    # A failed registration below must not leave the previous record describing new files.
+    rm -f "$MAT_SRC"
 fi
 
 echo "[1] Run P1 (STOP_AFTER=rigid, FORCE_RERUN=${P1_FORCE}) to obtain QSM_to_T1.mat ..."
@@ -208,8 +237,13 @@ if [[ ! -s "$MAT_Q2T" ]]; then
     exit 11
 fi
 if [[ "$P1_FRESH" == "1" ]]; then
-    printf 'qsm=%s\nqsm_sha1=%s\nt1=%s\nt1_sha1=%s\n' "$QSM" "$QSM_SHA1" "$T1" "$T1_SHA1" > "$MAT_SRC"
+    [[ -s "$T1_BRAIN" && -s "$P1_QC" ]] || { echo "ERROR: P1 did not retain T1_brain or its QC" >&2; exit 11; }
+    printf 'qsm=%s\nqsm_sha1=%s\nt1=%s\nt1_sha1=%s\nq2t_mat_sha1=%s\nt1_brain_sha1=%s\np1_qc_sha1=%s\n' \
+        "$QSM" "$QSM_SHA1" "$T1" "$T1_SHA1" "$(file_sha1 "$MAT_Q2T")" \
+        "$(file_sha1 "$T1_BRAIN")" "$(file_sha1 "$P1_QC")" > "${MAT_SRC}.tmp"
+    mv -f "${MAT_SRC}.tmp" "$MAT_SRC"
 fi
+echo "  P1 matrix provenance: ${P1_PROVENANCE}"
 
 DICE=$(qc_field reg_mask_dice "$P1_QC")
 
@@ -223,6 +257,8 @@ if [[ -s "$T1SEG" && "${P8_FORCE_SYNTHSEG:-0}" != "1" ]]; then
         echo "[2] Existing segmentation has no source record; regenerating it"
     elif [[ "$(qc_field t1_sha1 "$T1SEG_SRC")" != "$T1_SHA1" ]]; then
         echo "[2] Existing segmentation was made from a T1 with different content; regenerating it"
+    elif [[ "$(qc_field t1seg_sha1 "$T1SEG_SRC")" != "$(file_sha1 "$T1SEG")" ]]; then
+        echo "[2] Existing segmentation differs from the one its source record describes; regenerating it"
     elif "$PY310" - "$T1" "$T1SEG" <<'PYEOF'
 import sys
 
@@ -244,6 +280,8 @@ if [[ "$REUSE_T1SEG" == "1" ]]; then
     echo "[2] Reusing existing SynthSeg output on the same T1 grid: $T1SEG"
 else
     echo "[2] Run mri_synthseg --parc (--keepgeom, ${SYNTHSEG_THREADS} threads) ..."
+    # An interrupted run must not leave the previous record describing a partial segmentation.
+    rm -f "$T1SEG_SRC"
     if ! "$SYNTHSEG" --i "$T1" --o "$T1SEG" \
             --parc --keepgeom --cpu --threads "$SYNTHSEG_THREADS" \
             --vol "${QC_DIR}/${OUT_ID}_synthseg_vol.csv"; then
@@ -251,12 +289,12 @@ else
         exit 13
     fi
     [[ -s "$T1SEG" ]] || { echo "ERROR: SynthSeg did not generate $T1SEG" >&2; exit 13; }
-    printf 't1=%s\nt1_sha1=%s\n' "$T1" "$T1_SHA1" > "$T1SEG_SRC"
+    printf 't1=%s\nt1_sha1=%s\nt1seg_sha1=%s\n' "$T1" "$T1_SHA1" "$(file_sha1 "$T1SEG")" > "${T1SEG_SRC}.tmp"
+    mv -f "${T1SEG_SRC}.tmp" "$T1SEG_SRC"
 fi
 
 
 T1_TO_QSM="${MAT_DIR}/${OUT_ID}_T1_to_QSM.mat"
-T1_BRAIN="${MAT_DIR}/${OUT_ID}_T1_brain.nii.gz"
 if [[ -s "$T1_BRAIN" ]]; then
     "$PY310" - "$HERE" "$T1" "$T1_BRAIN" "$MAT_Q2T" "$T1_TO_QSM" "$BUILD_INFO" \
             "$GRID_CONVERSION_TAG" <<'PYEOF' || exit 12
@@ -304,11 +342,23 @@ if not np.allclose(shift, 0, atol=1e-3):
 M_q2t = np.loadtxt(q2t_p)
 M_f2q = np.linalg.inv(M_q2t) @ M_g
 np.savetxt(out_p, M_f2q, fmt="%.10f")
+
+# Report-only geometry diagnostics. FSL coordinates use pixdim while world coordinates use
+# the sform/qform; if their scales disagree, the two geometries differ. A 6-DOF result
+# should have unit singular values in mm-to-mm FLIRT coordinates.
+def pixdim_sform_rel_diff(img):
+    norms = np.linalg.norm(img.affine[:3, :3], axis=0)
+    zooms = np.array(img.header.get_zooms()[:3], float)
+    return float(np.max(np.abs(norms - zooms) / zooms))
+
+q2t_scale_dev = float(np.max(np.abs(np.linalg.svd(M_q2t[:3, :3], compute_uv=False) - 1.0)))
 with open(info_p, "w", encoding="utf-8") as fh:
     fh.write(f"grid_conversion={tag}\n")
     fh.write(f"t1_neurological={neuro}\n")
     fh.write("grid_shift_mm=" + "x".join(f"{round(v, 4) + 0.0:.4f}" for v in shift) + "\n")
     fh.write("legacy_grid_shift_mm=" + "x".join(f"{round(v, 4) + 0.0:.4f}" for v in legacy_shift) + "\n")
+    fh.write(f"t1_pixdim_sform_rel_diff={pixdim_sform_rel_diff(full):.6f}\n")
+    fh.write(f"q2t_scale_dev={q2t_scale_dev:.6f}\n")
 print(f"  [3] Saved {out_p} (full-resolution T1 to QSM transform)")
 PYEOF
 else
@@ -326,6 +376,7 @@ fi
 
 {
     printf 'qsm_sha1=%s\nt1_sha1=%s\n' "$QSM_SHA1" "$T1_SHA1"
+    printf 'p1_matrix_provenance=%s\n' "$P1_PROVENANCE"
     printf 'q2t_mat_sha1=%s\n' "$(file_sha1 "$MAT_Q2T")"
     printf 't1seg_sha1=%s\n' "$(file_sha1 "$T1SEG")"
     printf 'label_sha1=%s\n' "$(file_sha1 "$FINAL")"
@@ -335,7 +386,7 @@ echo "[5] QC ..."
 "$PY310" - "$QSM" "$FINAL" "$T1SEG" "$QC" "${QC_DIR}/${OUT_ID}_synthseg_vol.csv" \
             "$OUT_ID" "$DICE" "$QSM_PIX" "$T1_PIX" "$QSM_DT" "$HERE" "$T1" "$BUILD_INFO" <<'PYEOF'
 import csv
-import json
+import os
 import sys
 from pathlib import Path
 
@@ -478,7 +529,24 @@ if not np.isnan(ss_left_cortex_ml) and not np.isnan(icv_ml):
         warns.append(f"SynthSeg-reported left cortex x2={ss_left_cortex_ml * 2:.0f} mL differs from "
                      f"measured {cortex_ml:.0f} mL by >35% (some difference may arise from --keepgeom)")
 
-with open(qc_p, "w", encoding="utf-8") as fh:
+# Report-only geometry diagnostics (warnings; they do not change the QC result).
+build = dict(line.split("=", 1) for line in Path(build_info_p).read_text(encoding="utf-8").splitlines()
+             if "=" in line)
+qsm_norms = np.linalg.norm(qsm_img.affine[:3, :3], axis=0)
+qsm_zooms = np.array(qsm_img.header.get_zooms()[:3], float)
+qsm_pixdim_sform_rel_diff = float(np.max(np.abs(qsm_norms - qsm_zooms) / qsm_zooms))
+for name, value in (("QSM", qsm_pixdim_sform_rel_diff),
+                    ("T1", float(build.get("t1_pixdim_sform_rel_diff", "nan")))):
+    if value > 0.01:
+        warns.append(f"{name} pixdim and sform/qform voxel sizes differ by {value:.1%}; FSL and world "
+                     "geometry disagree")
+if float(build.get("q2t_scale_dev", "nan")) > 0.01:
+    warns.append(f"QSM_to_T1.mat is not rigid (max singular-value deviation {build['q2t_scale_dev']})")
+
+# Written to a temporary file and renamed, so an interrupted run never leaves a partial QC
+# file; qc_complete=1 is the last line, and P8 and P9 require it.
+tmp_qc = qc_p + ".tmp"
+with open(tmp_qc, "w", encoding="utf-8") as fh:
     fh.write(f"ID={oid}\n")
     fh.write(f"node={__import__('socket').gethostname()}\n")
     fh.write(f"qsm={qsm_p}\n")
@@ -507,10 +575,15 @@ with open(qc_p, "w", encoding="utf-8") as fh:
     fh.write(f"seg_qsm_dice={seg_qsm_dice:.4f}\n")
     fh.write(f"seg_brain_nvox={int(seg_brain.sum())}\n")
     fh.write(f"qsm_nonzero_nvox={int(nz.sum())}\n")
+    fh.write(f"qsm_pixdim_sform_rel_diff={qsm_pixdim_sform_rel_diff:.6f}\n")
+    fh.write(f"qsm_scl_slope={qsm_img.header['scl_slope']}\n")
+    fh.write(f"qsm_scl_inter={qsm_img.header['scl_inter']}\n")
     for w in warns:
         fh.write(f"WARNING: {w}\n")
     for e in errors:
         fh.write(f"ERROR: {e}\n")
+    fh.write("qc_complete=1\n")
+os.replace(tmp_qc, qc_p)
 
 print(f"  Native QSM grid {qsm_img.shape[:3]}; voxel volume {vox_ml:.4f} mL")
 print(f"  Cortical ribbon: {int(ribbon.sum())} voxels = {cortex_ml:.0f} mL; "
