@@ -31,6 +31,9 @@ QC="${QC_DIR}/${OUT_ID}_native_qc.txt"
 FINAL="${LABEL_DIR}/${OUT_ID}_aparc_aseg_QSMnative.nii.gz"
 T1SEG="${T1SEG_DIR}/${OUT_ID}_aparc+aseg_T1.nii.gz"
 T1SEG_SRC="${T1SEG_DIR}/${OUT_ID}_t1seg_source.txt"
+# SynthSeg's volume table (ICV, whole-brain cortex) is written with the segmentation and is
+# part of it: QC reads ICV from it, so it is recorded and verified like the segmentation.
+VOL_CSV="${QC_DIR}/${OUT_ID}_synthseg_vol.csv"
 MAT_Q2T="${MAT_DIR}/${OUT_ID}_QSM_to_T1.mat"
 MAT_SRC="${MAT_DIR}/${OUT_ID}_QSM_to_T1_source.txt"
 T1_BRAIN="${MAT_DIR}/${OUT_ID}_T1_brain.nii.gz"
@@ -118,6 +121,9 @@ existing_output_problems() {
     if [[ "$(qc_field t1_sha1 "$T1SEG_SRC")" != "$T1_SHA1" || \
             "$(qc_field t1seg_sha1 "$T1SEG_SRC")" != "$(qc_field t1seg_sha1 "$QC")" ]]; then
         echo "T1 segmentation source not verified for this T1"
+    fi
+    if [[ ! -s "$VOL_CSV" || "$(qc_field synthseg_vol_sha1 "$QC")" != "$(file_sha1 "$VOL_CSV")" ]]; then
+        echo "SynthSeg volume table changed since the label was built"
     fi
     if [[ "$(qc_field label_sha1 "$QC")" != "$(file_sha1 "$FINAL")" ]]; then
         echo "label differs from the one QC checked"
@@ -297,6 +303,9 @@ if [[ -s "$T1SEG" && "${P8_FORCE_SYNTHSEG:-0}" != "1" ]]; then
         echo "[2] Existing segmentation was made from a T1 with different content; regenerating it"
     elif [[ "$(qc_field t1seg_sha1 "$T1SEG_SRC")" != "$(file_sha1 "$T1SEG")" ]]; then
         echo "[2] Existing segmentation differs from the one its source record describes; regenerating it"
+    elif [[ ! -s "$VOL_CSV" || "$(qc_field vol_sha1 "$T1SEG_SRC")" != "$(file_sha1 "$VOL_CSV")" ]]; then
+        echo "[2] SynthSeg volume table is missing or differs from the one recorded with the segmentation;" \
+             "regenerating it"
     elif "$PY310" - "$T1" "$T1SEG" <<'PYEOF'
 import sys
 
@@ -319,15 +328,17 @@ if [[ "$REUSE_T1SEG" == "1" ]]; then
 else
     echo "[2] Run mri_synthseg --parc (--keepgeom, ${SYNTHSEG_THREADS} threads) ..."
     # An interrupted run must not leave the previous record describing a partial segmentation.
-    rm -f "$T1SEG_SRC"
+    rm -f "$T1SEG_SRC" "$VOL_CSV"
     if ! "$SYNTHSEG" --i "$T1" --o "$T1SEG" \
             --parc --keepgeom --cpu --threads "$SYNTHSEG_THREADS" \
-            --vol "${QC_DIR}/${OUT_ID}_synthseg_vol.csv"; then
+            --vol "$VOL_CSV"; then
         echo "ERROR: mri_synthseg failed" >&2
         exit 13
     fi
     [[ -s "$T1SEG" ]] || { echo "ERROR: SynthSeg did not generate $T1SEG" >&2; exit 13; }
-    printf 't1=%s\nt1_sha1=%s\nt1seg_sha1=%s\n' "$T1" "$T1_SHA1" "$(file_sha1 "$T1SEG")" > "${T1SEG_SRC}.tmp"
+    [[ -s "$VOL_CSV" ]] || { echo "ERROR: SynthSeg did not write its volume table $VOL_CSV" >&2; exit 13; }
+    printf 't1=%s\nt1_sha1=%s\nt1seg_sha1=%s\nvol_sha1=%s\n' "$T1" "$T1_SHA1" "$(file_sha1 "$T1SEG")" \
+        "$(file_sha1 "$VOL_CSV")" > "${T1SEG_SRC}.tmp"
     mv -f "${T1SEG_SRC}.tmp" "$T1SEG_SRC"
 fi
 
@@ -418,11 +429,12 @@ fi
     printf 'p1_t1_resolution=%s\np1_search_mode=%s\n' "$P1_T1_RES" "$P1_SEARCH"
     printf 'q2t_mat_sha1=%s\n' "$(file_sha1 "$MAT_Q2T")"
     printf 't1seg_sha1=%s\n' "$(file_sha1 "$T1SEG")"
+    printf 'synthseg_vol_sha1=%s\n' "$(file_sha1 "$VOL_CSV")"
     printf 'label_sha1=%s\n' "$(file_sha1 "$FINAL")"
 } >> "$BUILD_INFO"
 
 echo "[5] QC ..."
-"$PY310" - "$QSM" "$FINAL" "$T1SEG" "$QC" "${QC_DIR}/${OUT_ID}_synthseg_vol.csv" \
+"$PY310" - "$QSM" "$FINAL" "$T1SEG" "$QC" "$VOL_CSV" \
             "$OUT_ID" "$DICE" "$QSM_PIX" "$T1_PIX" "$QSM_DT" "$HERE" "$T1" "$BUILD_INFO" <<'PYEOF'
 import csv
 import os
@@ -560,7 +572,10 @@ except (TypeError, ValueError):
     # Step [1] verifies or regenerates P1's QC, so a missing Dice means the registration is unchecked.
     fail_rule("reg_mask_dice", f"reg_mask_dice unavailable (P1 QC missing or incomplete; dice={dice!r})")
 
-if not np.isnan(icv_ml) and not (1200.0 <= icv_ml <= 1900.0):
+# An unmeasured ICV fails, as an unmeasured Dice does; it was previously skipped (passed).
+if np.isnan(icv_ml):
+    fail_rule("synthseg_icv", f"SynthSeg ICV unavailable (no 'total intracranial' in {vol_csv.name})")
+elif not (1200.0 <= icv_ml <= 1900.0):
     fail_rule("synthseg_icv", f"SynthSeg ICV={icv_ml:.0f} mL is outside 1200-1900 mL")
 if not (350.0 <= cortex_ml <= 700.0):
     fail_rule("cortex_vol_qsm_grid",

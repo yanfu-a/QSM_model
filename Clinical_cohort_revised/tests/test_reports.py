@@ -37,6 +37,8 @@ def test_exclusions_are_counted_per_rule_and_stratum(tmp_path):
     _qc(native, "TWO", "reg_mask_dice,seg_qsm_dice", reg_mask_dice="0.5", seg_qsm_dice="0.5")
     _qc(native, "T1ONLY", "", "cortex_vol_t1", synthseg_cortex_ml="320", pixdim="0.8x0.8x0.8")
     _qc(native, "OLDQC", None)                                                # no rule record
+    _qc(native, "GRIDNOT1", "cortex_vol_qsm_grid", cortex_vol_ml="300", synthseg_cortex_ml="nan")
+    _qc(native, "NOVOL", synthseg_icv_ml="nan", synthseg_cortex_ml="nan")     # earlier P8: ICV rule skipped
     (native / "p1_rigid").mkdir()
     (native / "p1_rigid" / "P1STOP_qc_rigid.txt").write_text("reg_mask_dice=0.41\nWARNING: reg_mask_dice 0.41 < 0.60\n")
     rows = [{"image_dir_id": oid, "hospital_id": f"H{i}", "qsm_file": str(tmp_path / "absent.nii"), "t1_file": "",
@@ -44,7 +46,8 @@ def test_exclusions_are_counted_per_rule_and_stratum(tmp_path):
             for i, (oid, cov, dx) in enumerate([("PASS", "110", "AD"), ("GRIDONLY", "110", "AD"),
                                                 ("TWO", "144", "PSP"), ("T1ONLY", "144", "PSP"),
                                                 ("OLDQC", "144", "AD"), ("P1STOP", "110", "AD"),
-                                                ("NONE", "110", "")])]
+                                                ("NONE", "110", ""), ("GRIDNOT1", "144", "AD"),
+                                                ("NOVOL", "144", "AD")])]
     wl = write_worklist(tmp_path / "wl.csv", rows)
     pd.DataFrame({"hospital_id": ["H0", "H1", "H2", "H3", "H4", "H5"], "sex": list("FMFMFM")}).to_csv(
         tmp_path / "cov.csv", index=False)
@@ -60,14 +63,19 @@ def test_exclusions_are_counted_per_rule_and_stratum(tmp_path):
     rules = pd.read_csv(out / "qc_exclusions_by_rule.csv")
     get = lambda strat, level, rule: rules[(rules.stratifier == strat) & (rules.level == level)
                                            & (rules.rule == rule)].iloc[0]
+    # "Alone" needs every other applied rule measured and passed: TWO fails two rules, and P1STOP
+    # was evaluated on reg_mask_dice only.
     r = get("all", "all", "reg_mask_dice")
-    assert (r.n_evaluated, r.n_failed, r.n_failed_only_this_rule) == (5, 2, 1)   # TWO and P1STOP
+    assert (r.n_evaluated, r.n_not_evaluated, r.n_failed, r.n_failed_only_this_rule) == (7, 0, 2, 0)
+    r = get("all", "all", "synthseg_icv")
+    assert (r.n_evaluated, r.n_not_evaluated, r.n_failed) == (5, 1, 0)             # NOVOL not measured
     r = get("all", "all", "cortex_vol_qsm_grid")
-    assert (r.n_evaluated, r.n_failed, r.n_failed_only_this_rule) == (4, 1, 1)
+    assert (r.n_evaluated, r.n_failed, r.n_failed_only_this_rule) == (6, 2, 2)
     r = get("all", "all", "cortex_vol_t1")
-    assert r.applied == "report-only" and (r.n_failed, r.n_failed_only_this_rule) == (1, 1)
+    assert r.applied == "report-only" and (r.n_evaluated, r.n_not_evaluated) == (4, 2)
+    assert (r.n_failed, r.n_failed_only_this_rule) == (1, 1)
     r = get("all", "all", "any applied rule")
-    assert (r.n_evaluated, r.n_failed) == (5, 3)
+    assert (r.n_evaluated, r.n_failed) == (7, 4)
     assert get("coverage", "short", "reg_mask_dice").n_failed == 1
     assert get("model_label", "PSP", "seg_qsm_dice").n_failed == 1
     assert get("sex", "F", "any applied rule").n_failed == 1                        # TWO (H2)
@@ -75,7 +83,9 @@ def test_exclusions_are_counted_per_rule_and_stratum(tmp_path):
 
     cortex = pd.read_csv(out / "qc_cortex_rule_comparison.csv").set_index(["stratifier", "level"])
     c = cortex.loc[("all", "all")]
-    assert (c.excluded_only_by_qsm_grid_rule, c.of_which_pass_t1_rule, c.pass_qc_but_fail_t1_rule) == (1, 1, 1)
+    # GRIDNOT1 has no T1 cortex volume: counted as not measured, never as passing the T1 rule.
+    assert (c.excluded_only_by_qsm_grid_rule, c.of_which_pass_t1_rule, c.of_which_t1_not_measured) == (2, 1, 1)
+    assert (c.t1_not_measured, c.pass_qc_but_fail_t1_rule) == (2, 1)
     assert "rerun P8" in log
 
 

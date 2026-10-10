@@ -1,6 +1,7 @@
 """P8 end-to-end with stub tools: label correctness, verified reuse, invalidation, failures."""
 
 import fcntl
+import hashlib
 import shutil
 
 import numpy as np
@@ -216,6 +217,33 @@ def test_legacy_p1_qc_without_settings_is_re_registered(tools, subject, native):
     assert "T1 resolution 'not recorded'" in out and calls == ["P1 FORCE_RERUN=1"]
     assert qc_fields(native, "S")["p1_matrix_provenance"] == "fresh"
 
+
+
+@pytest.mark.parametrize("change", ["delete", "edit"])
+def test_segmentation_reuse_requires_its_volume_table(tools, subject, native, change):
+    """ICV and the T1 cortex volume come from SynthSeg's volume table, so it is part of the segmentation."""
+    vol = native / "qc" / "S_synthseg_vol.csv"
+    if change == "delete":
+        vol.unlink()
+    else:
+        vol.write_text(vol.read_text().replace("1500000", "1100000"))
+    code, out, calls = run_p8(tools, subject, native, "S")
+    assert code == 0, out
+    assert "SynthSeg volume table changed since the label was built" in out
+    assert any(c.startswith("synthseg") for c in calls)                     # segmentation regenerated
+    f = qc_fields(native, "S")
+    assert float(f["synthseg_icv_ml"]) == 1500 and float(f["synthseg_cortex_ml"]) == 433.0
+    assert f["synthseg_vol_sha1"] == hashlib.sha1(vol.read_bytes()).hexdigest()
+
+
+def test_missing_volume_measures_fail_or_stop(tools, subject, native):
+    code, out, _ = run_p8(tools, subject, native, "S", env={"P8_FORCE_SYNTHSEG": "1", "FAKE_SYNTHSEG_NO_VOL": "1"})
+    assert code == 13 and "did not write" in out
+    code, out, _ = run_p8(tools, subject, native, "S", env={"P8_FORCE_SYNTHSEG": "1", "FAKE_SYNTHSEG_NO_ICV": "1"})
+    assert code == 15, out
+    f = qc_fields(native, "S")
+    text = (native / "qc" / "S_native_qc.txt").read_text()
+    assert "ERROR: SynthSeg ICV unavailable" in text and f["qc_failed_rules"] == "synthseg_icv"
 
 def test_concurrent_run_is_refused(tools, subject, native):
     if shutil.which("flock") is None:

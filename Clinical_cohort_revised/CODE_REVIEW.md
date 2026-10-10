@@ -484,3 +484,57 @@ silently reused the downsampled-T1 matrix and its label.
   `compare_p9_runs.py`.
 - The default resolution is unchanged (decision D12).
 - `QSM_ROI_SEARCH_DEG` is not recorded by P1. After changing it, use `P8_FORCE_P1=1`.
+
+## Follow-up review of revision 4 (round 5)
+
+| ID | Comment | Verdict | Change |
+|---|---|---|---|
+| CR-23 | The D1 cortex-rule comparison counts a scan without a T1 cortex volume as passing the T1 rule | Correct (reproduced) | Pass requires a measurement; missing measurements reported separately |
+| CR-24 | P8 reuses a segmentation without its SynthSeg volume table, from which the new metric is read | Correct, and worse: the applied ICV rule was silently skipped | Volume table required, hashed and verified with the segmentation; an unmeasured ICV fails QC |
+
+### CR-23 Not measured read as passed (confirmed bug in the report; fixed)
+
+**Defect.** `fail_cortex_vol_t1` is false whenever the rule was not evaluated. The
+comparison counted `excluded_only_by_qsm_grid_rule & ~fail_cortex_vol_t1` as passing the T1
+rule.
+
+**Reproduced.** Two scans failed only the QSM-grid rule, and one had no T1 cortex volume.
+`of_which_pass_t1_rule` was 2 instead of 1.
+
+**The same flaw in the per-rule "alone" counts.** A scan stopped at P1's Dice gate (only
+that rule evaluated) counted as excluded by `reg_mask_dice` alone. So did a scan whose ICV
+was never measured.
+
+**Fix:**
+- A scan passes a rule only when the rule was evaluated and not failed.
+- "Alone" requires every other applied rule to be measured and passed.
+- New columns:
+  - `n_not_evaluated`: complete P8 QC, but the measurement is missing.
+  - `t1_not_measured`.
+  - `of_which_fail_t1_rule` and `of_which_t1_not_measured`, next to
+    `of_which_pass_t1_rule`.
+- The printed summary states the missing counts.
+
+### CR-24 SynthSeg volume table outside segmentation provenance (confirmed bug; fixed)
+
+**Defect.** QC reads ICV (an applied rule) and the whole-brain cortex volume (report-only)
+from `<IID>_synthseg_vol.csv`. Segmentation reuse checked neither that the table existed nor
+that it was the one written with the segmentation.
+
+**Reproduced.** After the table was deleted, P8 reused the segmentation and wrote
+`synthseg_icv_ml=nan`. The scan passed QC, because the ICV rule was skipped whenever ICV was
+missing. An edited table would also have gone undetected.
+
+**Fix:**
+- The volume table is now part of the segmentation:
+  - SynthSeg's run removes the old table and must write a new one (exit 13 otherwise).
+  - The table's SHA-1 is recorded in `t1seg_source.txt` (`vol_sha1`) and in the label's QC
+    (`synthseg_vol_sha1`).
+  - The segmentation is reused, and the label kept, only while the table matches.
+- An unmeasured ICV now fails the ICV rule, as an unmeasured Dice already did. It was
+  previously passed.
+- **Effect:**
+  - The range is unchanged. With the table now always present and verified, the guard
+    triggers only if the table lacks the `total intracranial` column.
+  - Segmentations recorded before this fix lack `vol_sha1`, so SynthSeg reruns once for
+    them. These come from revisions 2-4, so pilot subjects at most.

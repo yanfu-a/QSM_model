@@ -75,8 +75,11 @@ if os.environ.get("FAKE_SYNTHSEG_FAIL") == "1":
 a = sys.argv[1:]
 opt = lambda k: a[a.index(k) + 1]
 shutil.copy(os.environ["FAKE_SEG"], opt("--o"))
-open(opt("--vol"), "w").write("subject,total intracranial,left cerebral cortex,right cerebral cortex\\n"
-                              "x,1500000,215000,218000\\n")
+if os.environ.get("FAKE_SYNTHSEG_NO_ICV") == "1":
+    open(opt("--vol"), "w").write("subject,left cerebral cortex,right cerebral cortex\\nx,215000,218000\\n")
+elif os.environ.get("FAKE_SYNTHSEG_NO_VOL") != "1":
+    open(opt("--vol"), "w").write("subject,total intracranial,left cerebral cortex,right cerebral cortex\\n"
+                                  "x,1500000,215000,218000\\n")
 open(os.environ["STUB_LOG"], "a").write("synthseg " + opt("--i") + "\\n")
 '''
 

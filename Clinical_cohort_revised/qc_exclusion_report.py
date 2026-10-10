@@ -11,12 +11,17 @@ one protocol, diagnosis or sex before deciding on thresholds (METHODOLOGICAL_DEC
 
 Outputs in --out-dir:
   qc_rules_by_subject.csv     one row per scan: strata, stage reached, failed rules, metrics
-  qc_exclusions_by_rule.csv   per stratifier level and rule: scans evaluated, failed, and
-                              failed by that rule alone (for a report-only rule: failed while
-                              passing every applied rule, i.e. exclusions it would add); scans
-                              that stopped at P1's Dice gate were evaluated on that rule only
+  qc_exclusions_by_rule.csv   per stratifier level and rule: scans evaluated, not evaluated
+                              (complete P8 QC but no measurement), failed, and failed by that
+                              rule alone, i.e. with every other applied rule measured and
+                              passed (for a report-only rule: failed by a scan P8 passed, i.e.
+                              exclusions it would add)
   qc_cortex_rule_comparison.csv  cortex-volume rule on the QSM grid (applied) vs on the
                               whole-brain T1 segmentation (candidate), per stratifier level
+
+A rule counts as passed only when its measurement exists. A missing measurement is never
+read as a pass: it is reported in the not-evaluated and not-measured columns, unless P8
+itself failed the rule for it (an unavailable Dice or ICV), in which case it is a failure.
 
 Strata: protocol (QSM voxel size), coverage (short/full axial slab; strata.py), diagnosis
 (worklist model_label) and any column given with --by, from the worklist or a --covariates
@@ -128,9 +133,16 @@ def evaluate(df):
         df[f"fail_{rule}"] = evaluated & fails
     n_applied_failed = df[[f"fail_{r}" for r in APPLIED]].sum(axis=1)
     df["qc_evaluated"] = with_qc | df["stage"].eq("p1_dice_stop")
+    # P8's decision (what P9 uses); an applied rule P8 could not measure did not fail it.
     df["qc_pass"] = with_qc & n_applied_failed.eq(0)
     df["n_applied_rules_failed"] = n_applied_failed
+    df["all_applied_evaluated"] = df[[f"ev_{r}" for r in APPLIED]].all(axis=1)
     return df
+
+
+def failed_alone(g, rule):
+    """Failed this applied rule while every other applied rule was measured and passed."""
+    return g[f"fail_{rule}"] & g["n_applied_rules_failed"].eq(1) & g["all_applied_evaluated"]
 
 
 def tabulate(df, by):
@@ -143,32 +155,37 @@ def tabulate(df, by):
         base = {"stratifier": stratifier, "level": level, "n_scans": len(g)}
         for stage, n in g["stage"].value_counts().sort_index().items():
             rule_rows.append({**base, "rule": f"stage: {stage}", "applied": "stage", "n_evaluated": len(g),
-                              "n_failed": int(n), "pct_failed": round(100.0 * n / len(g), 1),
+                              "n_not_evaluated": np.nan, "n_failed": int(n), "pct_failed": round(100.0 * n / len(g), 1),
                               "n_failed_only_this_rule": np.nan})
+        with_qc = g["stage"].eq("p8_qc")
         n_ev = int(g["qc_evaluated"].sum())
         n_fail = int((g["qc_evaluated"] & ~g["qc_pass"]).sum())
         rule_rows.append({**base, "rule": "any applied rule", "applied": "summary", "n_evaluated": n_ev,
+                          "n_not_evaluated": int((with_qc & ~g["all_applied_evaluated"]).sum()),
                           "n_failed": n_fail, "pct_failed": round(100.0 * n_fail / n_ev, 1) if n_ev else np.nan,
                           "n_failed_only_this_rule": np.nan})
         for rule, (_, applied) in RULES.items():
             ev, fail = g[f"ev_{rule}"], g[f"fail_{rule}"]
-            if applied:
-                alone = fail & g["n_applied_rules_failed"].eq(1)
-            else:
-                alone = fail & g["qc_pass"]
+            alone = failed_alone(g, rule) if applied else fail & g["qc_pass"]
             n_ev_r = int(ev.sum())
             rule_rows.append({**base, "rule": rule, "applied": "yes" if applied else "report-only",
-                              "n_evaluated": n_ev_r, "n_failed": int(fail.sum()),
+                              "n_evaluated": n_ev_r, "n_not_evaluated": int((with_qc & ~ev).sum()),
+                              "n_failed": int(fail.sum()),
                               "pct_failed": round(100.0 * fail.sum() / n_ev_r, 1) if n_ev_r else np.nan,
                               "n_failed_only_this_rule": int(alone.sum())})
-        grid, t1 = g["fail_cortex_vol_qsm_grid"], g["fail_cortex_vol_t1"]
-        grid_alone = grid & g["n_applied_rules_failed"].eq(1)
+        t1_measured, t1_fail = g["ev_cortex_vol_t1"], g["fail_cortex_vol_t1"]
+        t1_pass = t1_measured & ~t1_fail
+        grid_alone = failed_alone(g, "cortex_vol_qsm_grid")
         cortex_rows.append({**base,
-                            "n_both_evaluated": int((g["ev_cortex_vol_qsm_grid"] & g["ev_cortex_vol_t1"]).sum()),
-                            "fail_qsm_grid": int(grid.sum()), "fail_t1": int(t1.sum()),
+                            "n_with_p8_qc": int(with_qc.sum()),
+                            "n_both_evaluated": int((g["ev_cortex_vol_qsm_grid"] & t1_measured).sum()),
+                            "t1_not_measured": int((with_qc & ~t1_measured).sum()),
+                            "fail_qsm_grid": int(g["fail_cortex_vol_qsm_grid"].sum()), "fail_t1": int(t1_fail.sum()),
                             "excluded_only_by_qsm_grid_rule": int(grid_alone.sum()),
-                            "of_which_pass_t1_rule": int((grid_alone & ~t1).sum()),
-                            "pass_qc_but_fail_t1_rule": int((g["qc_pass"] & t1).sum())})
+                            "of_which_pass_t1_rule": int((grid_alone & t1_pass).sum()),
+                            "of_which_fail_t1_rule": int((grid_alone & t1_fail).sum()),
+                            "of_which_t1_not_measured": int((grid_alone & ~t1_measured).sum()),
+                            "pass_qc_but_fail_t1_rule": int((g["qc_pass"] & t1_fail).sum())})
     return pd.DataFrame(rule_rows), pd.DataFrame(cortex_rows)
 
 
@@ -248,11 +265,16 @@ def main():
     if df["stage"].isin(["p8_qc_without_rule_record", "p8_qc_incomplete", "no_p8_qc"]).any():
         print("  Scans without a complete, rule-recording P8 QC are not counted per rule; rerun P8 for them.")
     overall = rules[(rules["stratifier"] == "all") & rules["applied"].isin(["yes", "report-only"])]
-    print("Rule (all scans): evaluated, failed (%), failed by this rule alone")
+    print("Rule (all scans): evaluated, not evaluated, failed (%), failed by this rule alone")
     for _, r in overall.iterrows():
         tag = "" if r["applied"] == "yes" else "  [report-only; 'alone' = would add exclusions]"
-        print(f"  {r['rule']:<22} {r['n_evaluated']:5d} {r['n_failed']:5d} ({r['pct_failed']}%) "
-              f"{int(r['n_failed_only_this_rule']):5d}{tag}")
+        print(f"  {r['rule']:<22} {r['n_evaluated']:5d} {int(r['n_not_evaluated']):5d} {r['n_failed']:5d} "
+              f"({r['pct_failed']}%) {int(r['n_failed_only_this_rule']):5d}{tag}")
+    c = cortex[cortex["stratifier"] == "all"].iloc[0]
+    print(f"Cortex rule: {c['excluded_only_by_qsm_grid_rule']} scans excluded by the QSM-grid rule alone; of "
+          f"these {c['of_which_pass_t1_rule']} pass, {c['of_which_fail_t1_rule']} fail and "
+          f"{c['of_which_t1_not_measured']} lack the T1 cortex volume; {c['pass_qc_but_fail_t1_rule']} passing "
+          f"scans would fail the T1 rule; {c['t1_not_measured']} scans with P8 QC lack the T1 cortex volume")
     print(f"Tables in {args.out_dir}: qc_rules_by_subject.csv, qc_exclusions_by_rule.csv, "
           "qc_cortex_rule_comparison.csv")
 

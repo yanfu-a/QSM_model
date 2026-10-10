@@ -8,7 +8,15 @@ Each change is marked for whether it can affect:
 
 "yes" means the change can alter that quantity for some subjects; "no" means it cannot.
 
-## Revision 5: conflicting worklist IDs
+## Revision 6 (this revision): missing measurements are never passes (CODE_REVIEW CR-23, CR-24)
+
+| Change | Values | ROIs | QC | N |
+|---|---|---|---|---|
+| P8: SynthSeg's volume table is required, recorded (`vol_sha1`, `synthseg_vol_sha1`) and verified before a segmentation or label is reused; SynthSeg must write it (exit 13 otherwise). Segmentations recorded without it are regenerated once (CR-24) | no | no | no | no |
+| P8: an unmeasured ICV fails the ICV rule (`SynthSeg ICV unavailable`) instead of passing it. The range is unchanged (CR-24) | no | no | yes (only without a measurable ICV) | yes (fewer, only scans without a measurable ICV; none expected now that the table is required) |
+| `qc_exclusion_report.py`: a rule is passed only when measured; "alone" requires every other applied rule measured and passed; `n_not_evaluated`, `t1_not_measured`, `of_which_fail_t1_rule`, `of_which_t1_not_measured` added (CR-23) | no | no | no | no |
+
+## Revision 5 (`282930a`): conflicting worklist IDs
 
 Repeated identical rows for an `image_dir_id` are retained once. If any field
 differs between rows for the same ID, that ID is excluded before runnable,
@@ -24,7 +32,7 @@ grid-conversion audit, and the README's P8 job-list examples.
 Repeated hospital IDs with different image IDs are still kept as repeated
 scans and flagged by P9's `repeat_patient`.
 
-## Revision 4: response to the external review (CODE_REVIEW CR-18 to CR-22)
+## Revision 4 (`24c5e5e`): response to the external review (CODE_REVIEW CR-18 to CR-22)
 
 No threshold, inclusion rule, support definition or ROI statistic changed. With identical
 inputs and options, `analysis_pass` and ROI values equal those of revision 3. Exit codes

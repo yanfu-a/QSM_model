@@ -180,9 +180,12 @@ $PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-d
 - `native_mask_voxel_counts.csv`;
 - with `--csf-ref`: `*_csfref.csv` and `*_csfref_analysis.csv`.
 
-**First full run.** Labels without the current QC fields (all labels made before this
-revision) are rebuilt once. SynthSeg reruns where the segmentation's source record cannot
-be verified. Afterwards, verified subjects are skipped in seconds.
+**First full run.**
+- Labels without the current QC fields (all labels made before this revision) are rebuilt
+  once.
+- SynthSeg reruns where the segmentation's source record, including its volume table
+  (`vol_sha1`), cannot be verified.
+- Afterwards, verified subjects are skipped in seconds.
 
 Peak P9 memory is roughly `--jobs` x 0.4 GB, because each subject's T1-space segmentation is
 read for coverage.
@@ -254,9 +257,14 @@ These two settings are recorded and checked before any reuse. `QSM_ROI_SEARCH_DE
 recorded, so use `P8_FORCE_P1=1` after changing it. P1's own Dice gate (`QSM_ROI_DICE_MIN`)
 is disabled inside P8, which applies its 0.60 gate in the QC step instead.
 
-**QC record:** `qc_failed_rules` names the failed rules, and `qc_report_only_failed_rules`
-names the failures of rules that are evaluated but not applied. See
-`qc_exclusion_report.py`.
+**QC record:**
+- `qc_failed_rules` names the failed rules, and `qc_report_only_failed_rules` names the
+  failures of rules that are evaluated but not applied. See `qc_exclusion_report.py`.
+- A rule whose measurement is missing is never counted as passed:
+  - in P8, an unavailable Dice or ICV fails;
+  - in the report, missing measurements are listed separately.
+- SynthSeg's volume table (`<IID>_synthseg_vol.csv` in `qc/`) is part of the segmentation.
+  It is hashed and verified before any reuse.
 
 **Exit codes:**
 

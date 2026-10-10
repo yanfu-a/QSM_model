@@ -50,6 +50,11 @@ then the full cohort. Pass sex with `--covariates`, because the worklist has no 
 - `qc_exclusions_by_rule.csv`: how many scans each rule excludes, and how many it excludes
   alone, by protocol, coverage, diagnosis and sex.
 - `qc_cortex_rule_comparison.csv`: how many scans option (b) would rescue or newly exclude.
+  A scan counts as passing the T1 rule only when its T1 cortex volume was measured. Scans
+  without it are listed as `of_which_t1_not_measured` and `t1_not_measured` (revision 6).
+- **Missing ICV (revision 6):** an unmeasured ICV now fails the ICV rule, as an unmeasured
+  Dice already did. P8 also requires and verifies SynthSeg's volume table, so this should
+  not occur.
 
 Columns: `P8_native_qc_errors`, `P8_cortex_vol_ml`, `t1_cortex_ml`, `P8_synthseg_icv_ml`,
 `P8_reg_mask_dice`, `P8_ribbon_in_qsm_frac`, `P8_gm_wm_contrast_ppb`.
