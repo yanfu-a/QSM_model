@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from strata import SHORT_COVERAGE_MM, coverage_group, si_extent_mm, voxel_size_label
+from worklist_ids import resolve_duplicate_ids
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_NATIVE_DIR = Path("/cwStorage/nodecw_group/FY_data/QSM_HUASHAN/native_data")
@@ -186,11 +187,14 @@ def main():
     args = ap.parse_args()
 
     wl = pd.read_csv(args.worklist, dtype=str).fillna("")
+    wl, conflicts = resolve_duplicate_ids(wl)
+    if conflicts:
+        print(f"Skipped {len(conflicts)} image_dir_id values with conflicting worklist rows: "
+              f"{[e['IID'] for e in conflicts]}")
     if "runnable" in wl.columns:
         wl = wl[wl["runnable"].str.strip().str.lower() == "yes"]
     if args.main_model_only:
         wl = wl[wl["include_main_model"].str.strip().str.lower() == "yes"]
-    wl = wl.drop_duplicates("image_dir_id")
     if args.ids_file:
         ids = pd.read_csv(args.ids_file, dtype=str).fillna("")
         col = next((c for c in ("IID", "image_dir_id") if c in ids.columns), None)

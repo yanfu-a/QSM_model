@@ -35,6 +35,7 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 from scipy import ndimage
+from worklist_ids import resolve_duplicate_ids
 
 DEFAULT_NATIVE_DIR = Path("/cwStorage/nodecw_group/FY_data/QSM_HUASHAN/native_data")
 HERE = Path(__file__).resolve().parent
@@ -189,9 +190,12 @@ def main():
         ap.error("--recon-mask-template must contain {IID}")
 
     wl = pd.read_csv(args.worklist, dtype=str).fillna("")
+    wl, conflicts = resolve_duplicate_ids(wl)
+    if conflicts:
+        print(f"Skipped {len(conflicts)} image_dir_id values with conflicting worklist rows: "
+              f"{[e['IID'] for e in conflicts]}")
     if "runnable" in wl.columns:
         wl = wl[wl["runnable"].str.strip().str.lower() == "yes"]
-    wl = wl.drop_duplicates("image_dir_id")
     if args.ids_file:
         p = pd.read_csv(args.ids_file, dtype=str).fillna("")
         idcol = next((c for c in ("IID", "image_dir_id") if c in p.columns), None)
@@ -204,12 +208,15 @@ def main():
         rows = list(ex.map(lambda t: make_one(t[0], t[1], args.out_dir, args.max_hole_mm3,
                                               args.overwrite, args.recon_mask_template),
                            zip(wl["image_dir_id"], wl["qsm_file"])))
-    summary = pd.DataFrame(rows)
+    summary = pd.DataFrame(rows, columns=["IID", "qsm_file", "support_mask",
+                                          *SUMMARY_FIELDS, "status"])
     summary_path = args.out_dir / "support_masks_summary.csv"
     if summary_path.is_file():
-        # Keep rows of subjects not processed in this run.
+        # Keep other subjects, but never advertise old masks for conflicting IDs.
         old = pd.read_csv(summary_path, dtype=str)
-        summary = pd.concat([old[~old["IID"].isin(summary["IID"])], summary], ignore_index=True)
+        excluded_ids = {e["IID"] for e in conflicts}
+        old = old[~old["IID"].isin(set(summary["IID"]) | excluded_ids)]
+        summary = pd.concat([old, summary], ignore_index=True)
     write_atomic_bytes(summary_path, summary.to_csv(index=False).encode("utf-8-sig"))
 
     status = pd.Series([r["status"] for r in rows], dtype=str)

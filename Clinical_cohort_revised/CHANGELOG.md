@@ -8,7 +8,23 @@ Each change is marked for whether it can affect:
 
 "yes" means the change can alter that quantity for some subjects; "no" means it cannot.
 
-## Revision 4 (this revision): response to the external review (CODE_REVIEW CR-18 to CR-22)
+## Revision 5: conflicting worklist IDs
+
+Repeated identical rows for an `image_dir_id` are retained once. If any field
+differs between rows for the same ID, that ID is excluded before runnable,
+main-model or pilot filters. The shared `worklist_ids.py` rule now applies in
+P9, support-mask generation, the P8 QC exclusion report, pilot selection, the
+grid-conversion audit, and the README's P8 job-list examples.
+
+| Change | Values | ROIs | QC | N |
+|---|---|---|---|---|
+| Exclude IDs whose duplicate rows differ in any worklist field, including coverage or runnable, and record the differing fields in P9's excluded table | no for retained IDs | no for retained IDs | no for retained IDs | yes for IDs previously accepted after filtering or non-key conflicts |
+| Remove old summary entries for now-conflicting IDs when support masks are rebuilt | no | no | no | no |
+
+Repeated hospital IDs with different image IDs are still kept as repeated
+scans and flagged by P9's `repeat_patient`.
+
+## Revision 4: response to the external review (CODE_REVIEW CR-18 to CR-22)
 
 No threshold, inclusion rule, support definition or ROI statistic changed. With identical
 inputs and options, `analysis_pass` and ROI values equal those of revision 3. Exit codes

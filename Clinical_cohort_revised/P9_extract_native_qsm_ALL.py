@@ -58,6 +58,7 @@ from scipy.ndimage import binary_erosion
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from strata import coverage_group, si_extent_mm, voxel_size_label  # noqa: E402
+from worklist_ids import resolve_duplicate_ids  # noqa: E402
 ATLAS_DIR = Path("/cwStorage/home/fuyan/FY_data/QSM_STAAR_251229/Session1_Pheno_extract/"
                  "Part1_Extract_QSM")
 DK_LABELS = ATLAS_DIR / "Desikan_labels.csv"
@@ -282,26 +283,6 @@ def build_label_map(csv_labels, labels_path, fs_home, allow_name_mismatch=False)
         print(f"WARNING: {msg}; continuing because --allow-label-name-mismatch was given.")
     rows.sort(key=lambda r: r["fs_label"])
     return fs_to_name, rows
-
-
-def resolve_duplicate_ids(wl):
-    """Drop repeated identical worklist rows; exclude IDs whose repeated rows disagree.
-
-    Row order cannot decide between two hospital_ids or diagnoses for one image
-    directory, so such IDs are excluded. Return (worklist, exclusion records).
-    """
-    check = [c for c in ("qsm_file", "t1_file") + META_COLS if c in wl.columns]
-    excluded = []
-    repeated = wl[wl["image_dir_id"].duplicated(keep=False)]
-    for oid, grp in repeated.groupby("image_dir_id", sort=False):
-        differing = [f"{c}={' | '.join(grp[c].unique())}" for c in check if grp[c].nunique() > 1]
-        if differing:
-            excluded.append({"IID": oid, "reason": "worklist rows disagree: " + "; ".join(differing)})
-    if excluded:
-        print(f"WARNING: {len(excluded)} image_dir_id values have conflicting worklist rows and are "
-              f"excluded until the worklist is corrected: {[e['IID'] for e in excluded]}")
-    conflicting = {e["IID"] for e in excluded}
-    return wl[~wl["image_dir_id"].isin(conflicting)].drop_duplicates("image_dir_id"), excluded
 
 
 def file_digest(path, chunk=1 << 20):
@@ -694,14 +675,16 @@ def main():
     absent = sorted(required - set(wl.columns))
     if absent:
         raise SystemExit(f"Missing worklist columns: {absent}. Rename input headers to English.")
-    excluded = []
+    wl, conflicts = resolve_duplicate_ids(wl)
+    excluded = list(conflicts)
+    if conflicts:
+        print(f"WARNING: {len(conflicts)} image_dir_id values have conflicting worklist rows and are "
+              f"excluded until the worklist is corrected: {[e['IID'] for e in conflicts]}")
     if "runnable" in wl.columns:
         runnable = wl["runnable"].str.strip().str.lower() == "yes"
         excluded += [{"IID": oid, "reason": f"worklist runnable={value!r}"}
                      for oid, value in zip(wl.loc[~runnable, "image_dir_id"], wl.loc[~runnable, "runnable"])]
         wl = wl[runnable]
-    wl, conflicts = resolve_duplicate_ids(wl)
-    excluded += conflicts
     if args.main_model_only:
         if "include_main_model" not in wl.columns:
             raise SystemExit("--main-model-only needs an include_main_model worklist column")

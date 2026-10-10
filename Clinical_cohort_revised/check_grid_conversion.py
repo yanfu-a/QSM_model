@@ -26,6 +26,7 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from native_grid import flirt_grid_conversion, is_neurological, legacy_grid_conversion  # noqa: E402
+from worklist_ids import resolve_duplicate_ids  # noqa: E402
 
 DEFAULT_NATIVE_DIR = Path("/cwStorage/nodecw_group/FY_data/QSM_HUASHAN/native_data")
 
@@ -85,9 +86,12 @@ def main():
     args = ap.parse_args()
 
     wl = pd.read_csv(args.worklist, dtype=str).fillna("")
+    wl, conflicts = resolve_duplicate_ids(wl)
+    if conflicts:
+        print(f"Skipped {len(conflicts)} image_dir_id values with conflicting worklist rows: "
+              f"{[e['IID'] for e in conflicts]}")
     if "runnable" in wl.columns:
         wl = wl[wl["runnable"].str.strip().str.lower() == "yes"]
-    wl = wl.drop_duplicates("image_dir_id")
     mat_dir = args.native_dir / "mat"
 
     rows = []

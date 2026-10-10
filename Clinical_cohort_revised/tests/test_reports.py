@@ -79,6 +79,21 @@ def test_exclusions_are_counted_per_rule_and_stratum(tmp_path):
     assert "rerun P8" in log
 
 
+def test_report_keeps_identical_rows_and_excludes_conflicts_before_main_model_filter(tmp_path):
+    native = tmp_path / "native"
+    for oid in ("SAME", "DIFFERENT", "UNIQUE"):
+        _qc(native, oid)
+    base = lambda oid: {"image_dir_id": oid, "qsm_file": str(tmp_path / "absent.nii"),
+                        "t1_file": "t1", "include_main_model": "yes"}
+    rows = [base("SAME"), base("SAME"), base("DIFFERENT"),
+            {**base("DIFFERENT"), "include_main_model": "no"}, base("UNIQUE")]
+    wl = write_worklist(tmp_path / "wl.csv", rows)
+    out, log = _report(tmp_path, wl, native, "--main-model-only")
+    subj = pd.read_csv(out / "qc_rules_by_subject.csv", dtype=str)
+    assert list(subj["IID"]) == ["SAME", "UNIQUE"]
+    assert "DIFFERENT" in log and "Skipped 1" in log
+
+
 @pytest.mark.slow
 def test_report_reads_p8_qc_files(tools, subject, tmp_path):
     native = tmp_path / "native"

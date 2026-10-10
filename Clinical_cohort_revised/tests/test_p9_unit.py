@@ -190,14 +190,19 @@ def test_failed_list_parsing(tmp_path):
     assert p9.read_failed_ids(tmp_path / "absent.txt") == {}
 
 
-def test_duplicate_ids_conflicting_t1_are_excluded():
-    wl = pd.DataFrame({"image_dir_id": ["A", "A", "B", "B", "C"],
-                       "qsm_file": ["q", "q", "qb", "qb", "qc"],
-                       "t1_file": ["t1", "t1_other", "tb", "tb", "tc"],
-                       "hospital_id": ["1", "1", "2", "2", "3"]})
+def test_duplicate_ids_identical_kept_and_any_conflict_excluded_before_filtering():
+    wl = pd.DataFrame({"image_dir_id": ["A", "A", "B", "B", "C", "D", "D", "E", "E"],
+                       "qsm_file": ["q", "q", "qb", "qb", "qc", "qd", "qd", "qe", "qe"],
+                       "t1_file": ["t1", "t1_other", "tb", "tb", "tc", "td", "td", "te", "te"],
+                       "hospital_id": ["1", "1", "2", "2", "3", "4", "4", "5", "5"],
+                       "qsm_coverage_mm": ["144"] * 6 + ["120", "144", "144"],
+                       "runnable": ["yes"] * 8 + ["no"]})
     kept, excluded = p9.resolve_duplicate_ids(wl)
     assert list(kept["image_dir_id"]) == ["B", "C"]
     assert excluded[0]["IID"] == "A" and "t1_file=t1 | t1_other" in excluded[0]["reason"]
+    assert [e["IID"] for e in excluded] == ["A", "D", "E"]
+    assert "qsm_coverage_mm=144 | 120" in excluded[1]["reason"]
+    assert "runnable=yes | no" in excluded[2]["reason"]
 
 
 def test_support_record_reading(tmp_path):

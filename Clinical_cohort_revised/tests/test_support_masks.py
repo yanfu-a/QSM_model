@@ -90,6 +90,21 @@ def test_provenance_reuse_and_invalidation(tmp_path):
     assert _run(wl, out, "--max-hole-mm3", "20")["S"] == "written"
 
 
+def test_support_keeps_identical_rows_and_removes_old_conflicting_summary(tmp_path):
+    qsm = tmp_path / "Q.nii"
+    nib.save(nib.Nifti1Image(_brain_qsm(), np.eye(4)), qsm)
+    base = lambda oid: {"image_dir_id": oid, "qsm_file": str(qsm), "t1_file": "t1"}
+    out = tmp_path / "support"
+    first = write_worklist(tmp_path / "first.csv", [base("SAME"), base("DIFFERENT")])
+    assert set(_run(first, out).index) == {"SAME", "DIFFERENT"}
+    changed = write_worklist(tmp_path / "changed.csv", [
+        base("SAME"), base("SAME"), base("DIFFERENT"),
+        {**base("DIFFERENT"), "qsm_coverage_mm": "120"}])
+    status = _run(changed, out)
+    assert set(status.index) == {"SAME"}
+    assert status["SAME"] == "kept (provenance verified)"
+
+
 def test_reconstruction_masks_are_registered_and_grid_checked(tmp_path):
     aff = np.diag([-1.0, 1.0, 1.0, 1.0])
     q = _brain_qsm()

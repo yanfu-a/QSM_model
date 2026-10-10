@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from strata import SHORT_COVERAGE_MM, coverage_group, si_extent_mm, voxel_size_label
+from worklist_ids import resolve_duplicate_ids
 
 HERE = Path(__file__).resolve().parent
 
@@ -41,10 +42,12 @@ def main():
     args = ap.parse_args()
 
     wl = pd.read_csv(args.worklist, dtype=str).fillna("")
+    wl, conflicts = resolve_duplicate_ids(wl)
+    if conflicts:
+        print(f"Skipped {len(conflicts)} image_dir_id values with conflicting worklist rows: "
+              f"{[e['IID'] for e in conflicts]}")
     if "runnable" in wl.columns:
         wl = wl[wl["runnable"].str.strip().str.lower() == "yes"]
-    # IDs with conflicting worklist rows are excluded by P9; keep them out of the pilot.
-    wl = wl[~wl["image_dir_id"].duplicated(keep=False)]
 
     rows = []
     for _, r in wl.iterrows():

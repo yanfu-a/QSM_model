@@ -60,9 +60,13 @@ WL=$PWD/worklist.csv                           # copy of Clinical_cohort/worklis
 PY=/home1/fuyan/.conda/envs/py310/bin/python
 ```
 
-**Fix the worklist first.** Six image_dir_ids have conflicting rows: two hospital_ids, and
-some have two diagnoses. They stay excluded until corrected: P191936, P194010, P195951,
-P196693, P196837, P201485.
+**Fix the worklist first.** Repeated identical rows for an `image_dir_id` are kept once;
+any difference between rows for the same ID excludes that ID before runnable or
+main-model filtering. Six IDs were already known to have conflicting rows (two
+hospital_ids or diagnoses): P191936, P194010, P195951, P196693, P196837, P201485.
+P9 lists excluded IDs and the differing fields in `*_excluded.csv`. Multiple scans
+with different `image_dir_id` values from one patient remain eligible and are
+identified by `repeat_patient`.
 
 ## 1. Representative pilot
 
@@ -75,9 +79,11 @@ $PY select_pilot.py --worklist $WL --out pilot_ids.csv --per-stratum 2
 $PY - "$WL" pilot_ids.csv > pilot_jobs.tsv <<'EOF'
 import sys
 import pandas as pd
+from worklist_ids import resolve_duplicate_ids
 w = pd.read_csv(sys.argv[1], dtype=str).fillna("")
+w, _ = resolve_duplicate_ids(w)
 ids = set(pd.read_csv(sys.argv[2], dtype=str)["IID"])
-w = w[w["image_dir_id"].isin(ids)].drop_duplicates("image_dir_id")
+w = w[w["image_dir_id"].isin(ids)]
 w[["qsm_file", "t1_file", "image_dir_id"]].to_csv(sys.stdout, sep="\t", index=False, header=False)
 EOF
 
@@ -138,8 +144,10 @@ python -m pytest tests -m fsl -v
 $PY - "$WL" > p8_jobs.tsv <<'EOF'
 import sys
 import pandas as pd
+from worklist_ids import resolve_duplicate_ids
 w = pd.read_csv(sys.argv[1], dtype=str).fillna("")
-w = w[w["runnable"].str.strip().str.lower() == "yes"].drop_duplicates("image_dir_id")
+w, _ = resolve_duplicate_ids(w)
+w = w[w["runnable"].str.strip().str.lower() == "yes"]
 w[["qsm_file", "t1_file", "image_dir_id"]].to_csv(sys.stdout, sep="\t", index=False, header=False)
 EOF
 while IFS=$'\t' read -r qsm t1 iid; do          # or submit each line through your scheduler
