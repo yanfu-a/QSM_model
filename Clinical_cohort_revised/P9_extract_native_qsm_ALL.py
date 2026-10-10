@@ -24,6 +24,8 @@ rows of *_analysis.csv) only if all of the following hold:
   * in support-mask mode, the support mask's provenance record verifies against the
     current QSM and the mask file.
 CSF referencing (--csf-ref) has its own eligibility flag and never changes analysis_pass.
+Every runnable worklist row is processed unless --main-model-only restricts the run to
+include_main_model=yes; include_main_model is carried into every output table.
 An ROI value is reported only when the ROI has enough valid voxels, valid volume (mm3)
 and coverage of a finite, positive T1-space volume. Worklist IDs whose repeated rows
 disagree (e.g. two hospital_ids, diagnoses or input files) are excluded; every excluded
@@ -54,6 +56,8 @@ import pandas as pd
 from scipy.ndimage import binary_erosion
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from strata import coverage_group, si_extent_mm, voxel_size_label  # noqa: E402
 ATLAS_DIR = Path("/cwStorage/home/fuyan/FY_data/QSM_STAAR_251229/Session1_Pheno_extract/"
                  "Part1_Extract_QSM")
 DK_LABELS = ATLAS_DIR / "Desikan_labels.csv"
@@ -420,10 +424,16 @@ def extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, min_voxels, min_mm3, min
     keep = slot >= 0
     s_all = slot[keep]
     ok = valid.ravel()[keep]
-    s, v = s_all[ok], qsm.ravel()[keep][ok]
+    v_all = qsm.ravel()[keep]
+    s, v = s_all[ok], v_all[ok]
 
     label_counts = np.bincount(s_all, minlength=n_keys)
     counts = np.bincount(s, minlength=n_keys)
+    # Voxels with QSM exactly 0: counted as genuine values inside the support, and left out
+    # as padding outside it. For quantized QSM an estimated support cannot tell the two
+    # apart at the brain edge (METHODOLOGICAL_DECISIONS D3), so both are reported.
+    zero_counts = np.bincount(s[v == 0], minlength=n_keys)
+    unsupported_zero_counts = np.bincount(s_all[~ok & (v_all == 0)], minlength=n_keys)
     means = np.full(n_keys, np.nan)
     medians = np.full(n_keys, np.nan)
     if v.size:
@@ -466,6 +476,7 @@ def extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, min_voxels, min_mm3, min
         status = "OK"
     iqr = float(np.subtract(*np.percentile(v, [75, 25]))) if v.size else float("nan")
     return {"status": status, "label_counts": label_counts, "counts": counts,
+            "zero_counts": zero_counts, "unsupported_zero_counts": unsupported_zero_counts,
             "means": means, "medians": medians, "coverage": coverage,
             "n_low_voxels": int(low_count.sum()), "n_low_coverage": int(low_coverage.sum()),
             "n_reportable": n_reportable, "cortex_iqr": iqr}
@@ -495,8 +506,10 @@ def process_subject(task, keys, opts):
                   else np.full(len(keys), np.nan))
         res = extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, opts["min_voxels"],
                           opts["min_mm3"], opts["min_coverage"])
-        hdr = nib.load(str(task["qsm"])).header
+        qsm_img = nib.load(str(task["qsm"]))
+        hdr = qsm_img.header
         nonzero = np.isfinite(qsm) & (qsm != 0)
+        integer_valued = bool(nonzero.any() and np.all(np.mod(qsm[nonzero], 1) == 0))
         res.update(t1_mm3=t1_mm3, vox_mm3=vox_mm3, pixdim="x".join(f"{z:.4g}" for z in zooms),
                    qsm_sha1=file_digest(task["qsm"]),
                    t1_sha1=file_digest(task["t1"]),
@@ -505,7 +518,11 @@ def process_subject(task, keys, opts):
                    # Reported, never used to rescale: on-disk type, NIfTI scaling, integer values.
                    qsm_dtype=str(hdr.get_data_dtype()),
                    qsm_scl_slope=float(hdr["scl_slope"]), qsm_scl_inter=float(hdr["scl_inter"]),
-                   qsm_integer_valued=bool(nonzero.any() and np.all(np.mod(qsm[nonzero], 1) == 0)))
+                   qsm_integer_valued=integer_valued,
+                   # Quantized: stored as integers (any scl_slope) or integer-valued after scaling.
+                   # Genuine zeros then occur, and an estimated support misses those at the edge.
+                   qsm_quantized=bool(np.issubdtype(hdr.get_data_dtype(), np.integer) or integer_valued),
+                   si_extent_mm=si_extent_mm(qsm_img))
         if task["support"] is not None:
             res.update(support_sha1=file_digest(task["support"]),
                        support_record=read_support_record(task["support"]),
@@ -602,6 +619,9 @@ def main():
                          "or has no stage evidence (diagnostics only; they never enter the analysis set)")
     ap.add_argument("--ids-file", type=Path, default=None,
                     help="Process only subjects in this list (e.g., pilot_native.csv)")
+    ap.add_argument("--main-model-only", action="store_true",
+                    help="Process only worklist rows with include_main_model=yes (by default every "
+                         "runnable row is processed and include_main_model is carried into the outputs)")
     ap.add_argument("--sample-root", type=Path, default=None,
                     help="Sample root; each subject directory must contain one QSM and one T1 image")
     ap.add_argument("--support-dir", type=Path, default=None,
@@ -682,6 +702,15 @@ def main():
         wl = wl[runnable]
     wl, conflicts = resolve_duplicate_ids(wl)
     excluded += conflicts
+    if args.main_model_only:
+        if "include_main_model" not in wl.columns:
+            raise SystemExit("--main-model-only needs an include_main_model worklist column")
+        main_model = wl["include_main_model"].str.strip().str.lower() == "yes"
+        excluded += [{"IID": oid, "reason": f"worklist include_main_model={value!r} (--main-model-only)"}
+                     for oid, value in zip(wl.loc[~main_model, "image_dir_id"],
+                                           wl.loc[~main_model, "include_main_model"])]
+        wl = wl[main_model]
+        print(f"Main-model rows only (--main-model-only): {len(wl)} subjects")
 
     # The P1 failure list mixes stages. A failure in a stage the native branch shares (QSM
     # input, QSM->T1 rigid registration) excludes the subject, as does an entry without stage
@@ -818,6 +847,8 @@ def main():
     n_sub, n_keys = len(ids), len(keys)
     counts = np.zeros((n_sub, n_keys), dtype=np.int64)
     label_counts = np.zeros((n_sub, n_keys), dtype=np.int64)
+    zero_counts = np.zeros((n_sub, n_keys), dtype=np.int64)
+    unsupported_zero = np.zeros((n_sub, n_keys), dtype=np.int64)
     means = np.full((n_sub, n_keys), np.nan)
     medians = np.full((n_sub, n_keys), np.nan)
     coverage = np.full((n_sub, n_keys), np.nan)
@@ -828,6 +859,7 @@ def main():
         if "counts" not in r:
             continue
         counts[i], label_counts[i] = r["counts"], r["label_counts"]
+        zero_counts[i], unsupported_zero[i] = r["zero_counts"], r["unsupported_zero_counts"]
         means[i], medians[i] = r["means"], r["medians"]
         coverage[i], t1_mm3[i], vox_mm3[i] = r["coverage"], r["t1_mm3"], r["vox_mm3"]
 
@@ -956,6 +988,17 @@ def main():
     repeat_patient = (hosp.ne("") & hosp.duplicated(keep=False)).to_numpy()
     cortex_iqr = np.array([r.get("cortex_iqr", np.nan) for r in results], dtype=float)
     records = [r.get("support_record") or {} for r in results]
+    # Protocol stratum: QSM voxel size and axial coverage (worklist qsm_coverage_mm, else the
+    # superior-inferior extent of the QSM field of view).
+    fov_si_mm = np.array([r.get("si_extent_mm", np.nan) for r in results], dtype=float)
+    wl_coverage = (pd.to_numeric(sub["qsm_coverage_mm"], errors="coerce").to_numpy(float)
+                   if "qsm_coverage_mm" in sub.columns else np.full(n_sub, np.nan))
+    coverage_mm = np.where(np.isfinite(wl_coverage), wl_coverage, fov_si_mm)
+    protocol = [voxel_size_label(r["pixdim"]) if r.get("pixdim") else "unknown" for r in results]
+    coverage_grp = [coverage_group(c) for c in coverage_mm]
+    stratum = np.array([f"{p} | {c}" for p, c in zip(protocol, coverage_grp)], dtype=object)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cortex_zero_frac = zero_counts.sum(axis=1) / counts.sum(axis=1)
     qc_out = pd.DataFrame({
         "IID": ids,
         "analysis_pass": analysis_pass,
@@ -982,6 +1025,11 @@ def main():
         "P8_ribbon_in_qsm_frac": [x[2].get("ribbon_in_qsm_frac", "") for x in p8_qc],
         "P8_cortex_vol_ml": [x[2].get("cortex_vol_ml", "") for x in p8_qc],
         "P8_synthseg_icv_ml": [x[2].get("synthseg_icv_ml", "") for x in p8_qc],
+        "P8_synthseg_cortex_ml": [x[2].get("synthseg_cortex_ml", "") for x in p8_qc],
+        "P8_qc_failed_rules": [x[2].get("qc_failed_rules", "") for x in p8_qc],
+        "P8_qc_report_only_failed_rules": [x[2].get("qc_report_only_failed_rules", "") for x in p8_qc],
+        "P8_p1_t1_resolution": [x[2].get("p1_t1_resolution", "") for x in p8_qc],
+        "P8_p1_search_mode": [x[2].get("p1_search_mode", "") for x in p8_qc],
         "P8_grid_conversion": [x[2].get("grid_conversion", "") for x in p8_qc],
         "P8_t1_neurological": [x[2].get("t1_neurological", "") for x in p8_qc],
         "P8_p1_matrix_provenance": [x[2].get("p1_matrix_provenance", "") for x in p8_qc],
@@ -1000,6 +1048,10 @@ def main():
         "qsm_scl_slope": [r.get("qsm_scl_slope", "") for r in results],
         "qsm_scl_inter": [r.get("qsm_scl_inter", "") for r in results],
         "qsm_integer_valued": [r.get("qsm_integer_valued", "") for r in results],
+        "qsm_quantized": [r.get("qsm_quantized", "") for r in results],
+        "qsm_protocol": protocol,
+        "qsm_fov_si_mm": fov_si_mm.round(1),
+        "qsm_coverage_group": coverage_grp,
         "qsm_coverage_mm": (sub["qsm_coverage_mm"].to_numpy() if "qsm_coverage_mm" in sub.columns
                             else [""] * n_sub),
         "t1_cortex_ml": np.where(np.isfinite(t1_mm3).any(axis=1), np.nansum(t1_mm3, axis=1) / 1000.0, np.nan),
@@ -1008,6 +1060,8 @@ def main():
         "csf_ref_ppb": csf_values,
         "csf_voxels": csf_counts,
         "label_voxels_without_qsm_support": (label_counts - counts).sum(axis=1),
+        "cortex_valid_zero_fraction": np.round(cortex_zero_frac, 5),
+        "cortex_unsupported_zero_voxels": unsupported_zero.sum(axis=1),
         "n_reportable_rois": n_reportable,
         "n_nan_DK": out[[f"{n}_{primary}" for n in names]].isna().sum(axis=1).to_numpy(),
         "n_low_voxels": [r.get("n_low_voxels", n_keys) for r in results],
@@ -1034,6 +1088,8 @@ def main():
         "ROI": np.tile(names, n_sub),
         "atlas_label_voxels": label_counts.ravel(),
         "valid_qsm_voxels": counts.ravel(),
+        "valid_zero_voxels": zero_counts.ravel(),
+        "unsupported_zero_voxels": unsupported_zero.ravel(),
         "coverage_fraction": cov.ravel().round(4),
         "coverage_definition": ("explicit_support_mask" if args.support_dir
                                 else "nonzero_QSM_proxy; valid zeros may be excluded"),
@@ -1044,6 +1100,24 @@ def main():
         "coverage_vs_t1": coverage.ravel().round(4),
         "roi_value_reported": np.isfinite(reported).ravel(),
     }), args.out_dir / f"native_roi_coverage{sfx}.csv")
+
+    # ROI missingness in the analysis set, overall and by protocol stratum. Missing values
+    # depend on slab coverage, so they are not missing at random across protocols (D2).
+    present = np.isfinite(reported)
+    miss_rows = []
+    for level in ["all"] + sorted(set(stratum[analysis_pass])):
+        rows_in = analysis_pass & (np.ones(n_sub, dtype=bool) if level == "all" else stratum == level)
+        n = int(rows_in.sum())
+        for j, nm in enumerate(names):
+            k = int(present[rows_in, j].sum())
+            cov_j = coverage[rows_in, j]
+            miss_rows.append({"stratum": level, "ROI": nm, "n_subjects": n, "n_reported": k,
+                              "missing_fraction": round(1.0 - k / n, 4) if n else np.nan,
+                              "median_coverage_vs_t1": (round(float(np.median(cov_j[np.isfinite(cov_j)])), 4)
+                                                        if np.isfinite(cov_j).any() else np.nan)})
+    write_csv(pd.DataFrame(miss_rows, columns=["stratum", "ROI", "n_subjects", "n_reported",
+                                               "missing_fraction", "median_coverage_vs_t1"]),
+              args.out_dir / f"native_roi_missingness{sfx}.csv")
     write_run_info({"extracted": n_sub, "excluded": len(excluded),
                     "extraction_ok": sum(1 for s in status if s == "OK"),
                     "analysis_pass": int(analysis_pass.sum()),
@@ -1075,6 +1149,18 @@ def main():
     if repeat_patient.any():
         print(f"  Note: {int(repeat_patient.sum())} rows belong to patients with more than one scan "
               "(repeat_patient); they are not independent observations")
+    if analysis_pass.any():
+        complete = analysis_pass & (n_reportable == n_keys)
+        by_stratum = Counter(stratum[analysis_pass])
+        full = Counter(stratum[complete])
+        print(f"Analysis-set subjects with all {n_keys} ROI values: {int(complete.sum())}/{int(analysis_pass.sum())} ("
+              + "; ".join(f"{k}: {full.get(k, 0)}/{v}" for k, v in sorted(by_stratum.items()))
+              + f"); missingness by ROI and stratum in native_roi_missingness{sfx}.csv")
+    if not args.main_model_only and "include_main_model" in meta_out.columns:
+        outside = analysis_pass & meta_out["include_main_model"].str.strip().str.lower().ne("yes").to_numpy()
+        if outside.any():
+            print(f"  Note: {int(outside.sum())} analysis-set subjects have include_main_model other than "
+                  "'yes'; use --main-model-only, or filter on include_main_model, for the main model")
 
     if not analysis_pass.any():
         print("\nNo QC-passing subjects; per-ROI summaries skipped.")

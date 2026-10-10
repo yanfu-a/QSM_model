@@ -110,3 +110,22 @@ def test_reconstruction_masks_are_registered_and_grid_checked(tmp_path):
     record = json.loads(provenance_path(out / "S_support.nii.gz").read_text())
     assert record["support_type"] == "reconstruction" and record["max_hole_mm3"] is None
     assert record["qsm_nonzero_outside_support"] > 0    # reported for review, not hidden
+
+
+def test_quantization_is_recorded_and_float_hole_filling_is_flagged(tmp_path):
+    aff = np.diag([-1.0, 1.0, 1.0, 1.0])
+    q = _brain_qsm() * 1.37                            # non-integer float QSM with small enclosed zero holes
+    nib.save(nib.Nifti1Image(q, aff), tmp_path / "F.nii")
+    scaled = nib.Nifti1Image(np.rint(q * 10).astype(np.int16), aff)
+    scaled.header.set_slope_inter(0.001, 0.0)          # stored integers, not integer-valued after scaling
+    nib.save(scaled, tmp_path / "I.nii")
+    wl = write_worklist(tmp_path / "wl.csv", [{"image_dir_id": oid, "qsm_file": str(tmp_path / f"{oid}.nii"),
+                                               "t1_file": "t1"} for oid in ("F", "I")])
+    proc = subprocess.run([sys.executable, str(REVISED / "make_support_masks.py"), "--worklist", str(wl),
+                           "--out-dir", str(tmp_path / "support"), "--jobs", "1"], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rec = {oid: json.loads(provenance_path(tmp_path / "support" / f"{oid}_support.nii.gz").read_text())
+           for oid in ("F", "I")}
+    assert rec["F"]["qsm_quantized"] is False and rec["F"]["filled_voxels"] > 0
+    assert rec["I"]["qsm_quantized"] is True and rec["I"]["qsm_integer_valued"] is False
+    assert "1 non-quantized QSM maps had enclosed zero holes filled" in proc.stdout

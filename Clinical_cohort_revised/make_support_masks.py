@@ -141,6 +141,7 @@ def make_one(oid, qsm_path, out_dir, max_hole_mm3, overwrite, recon_template):
         mask = nib.Nifti1Image(support.astype(np.uint8), img.affine)
         mask.set_sform(img.affine, int(img.header["sform_code"]) or 1)
         mask.set_qform(img.affine, int(img.header["qform_code"]) or 1)
+        integer_valued = bool(np.all(np.mod(qsm[nonzero], 1) == 0)) if nonzero.any() else False
         prov.unlink(missing_ok=True)            # never leave an old record next to a new mask
         tmp = out.with_name(f".{out.name}.tmp.nii.gz")
         nib.save(mask, str(tmp))
@@ -149,7 +150,10 @@ def make_one(oid, qsm_path, out_dir, max_hole_mm3, overwrite, recon_template):
                   "source_mask_file": str(source) if source is not None else None,
                   "mask_file": str(out), "mask_sha1": file_sha1(out),
                   "qsm_dtype": str(img.get_data_dtype()),
-                  "qsm_integer_valued": bool(np.all(np.mod(qsm[nonzero], 1) == 0)) if nonzero.any() else False,
+                  "qsm_integer_valued": integer_valued,
+                  # Stored as integers (any scl_slope) or integer-valued: genuine zeros occur,
+                  # and an estimated mask misses those touching the brain edge (D3).
+                  "qsm_quantized": bool(np.issubdtype(img.get_data_dtype(), np.integer) or integer_valued),
                   "nonzero_voxels": int(nonzero.sum()), "holes_filled": n_holes, "filled_voxels": filled,
                   "largest_filled_hole_mm3": round(largest, 3), "support_voxels": int(support.sum()),
                   "qsm_nonzero_outside_support": int((nonzero & ~support).sum()),
@@ -162,7 +166,7 @@ def make_one(oid, qsm_path, out_dir, max_hole_mm3, overwrite, recon_template):
 
 
 SUMMARY_FIELDS = ("support_type", "method", "max_hole_mm3", "qsm_sha1", "mask_sha1", "qsm_dtype",
-                  "qsm_integer_valued", "nonzero_voxels", "holes_filled", "filled_voxels",
+                  "qsm_integer_valued", "qsm_quantized", "nonzero_voxels", "holes_filled", "filled_voxels",
                   "largest_filled_hole_mm3", "support_voxels", "qsm_nonzero_outside_support")
 
 
@@ -216,8 +220,15 @@ def main():
     done = pd.DataFrame([r for r in rows if not r["status"].startswith("ERROR")])
     if len(done) and "filled_voxels" in done:
         frac = done["filled_voxels"].astype(float) / done["nonzero_voxels"].astype(float).clip(lower=1)
+        quantized = done["qsm_quantized"].astype(str).eq("True")
         print(f"  enclosed zero voxels added: median fraction {frac.median():.2e}, max {frac.max():.2e}; "
-              f"integer-valued QSM: {int(done['qsm_integer_valued'].astype(str).eq('True').sum())}")
+              f"quantized QSM: {int(quantized.sum())} of {len(done)}")
+        # In non-quantized QSM an exact zero is essentially never a reconstructed value, so
+        # filled holes there are more likely masked-out voxels than genuine zeros (D3).
+        float_filled = done["qsm_quantized"].astype(str).eq("False") & (done["filled_voxels"].astype(float) > 0)
+        if float_filled.any():
+            print(f"  WARNING: {int(float_filled.sum())} non-quantized QSM maps had enclosed zero holes filled "
+                  "(likely masked-out voxels, not genuine zeros; see METHODOLOGICAL_DECISIONS D3)")
     for r in rows:
         if r["status"].startswith("ERROR"):
             print(f"  {r['IID']}: {r['status']}")

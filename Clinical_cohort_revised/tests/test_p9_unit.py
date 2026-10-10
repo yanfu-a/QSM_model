@@ -98,6 +98,43 @@ def test_zero_supported_voxels_keeps_label_counts():
     assert r["label_counts"][0] == 100 and r["counts"][0] == 0
 
 
+
+def test_zero_valued_voxels_are_counted_inside_and_outside_support():
+    lab = np.full((10, 10, 1), 1001)
+    q = np.full(lab.shape, 5.0, np.float32)
+    q[0, :5] = 0                                   # five zeros inside the support
+    q[1, :3] = 0                                   # three zeros outside it
+    valid = np.ones(lab.shape, bool)
+    valid[1, :] = False
+    r = p9.extract_one(lab, q, valid, [1001], 1.0, np.array([100.0]), 1, 0.0, 0.0)
+    assert r["counts"][0] == 90 and r["zero_counts"][0] == 5 and r["unsupported_zero_counts"][0] == 3
+    assert r["medians"][0] == 5.0 and np.isclose(r["means"][0], 85 * 5.0 / 90)
+
+
+def test_scaled_integer_qsm_is_reported_as_quantized(tmp_path):
+    data = np.zeros((6, 6, 6), np.int16)
+    data[1:5, 1:5, 1:5] = np.arange(64).reshape(4, 4, 4) - 20
+    img = nib.Nifti1Image(data, np.eye(4))
+    img.header.set_slope_inter(0.001, 0.0)         # stored integers, ppm after scaling
+    nib.save(img, tmp_path / "q.nii.gz")
+    nib.save(nib.Nifti1Image(np.full((6, 6, 6), 1001, np.int16), np.eye(4)), tmp_path / "l.nii.gz")
+    (tmp_path / "t1.nii").write_bytes(b"t1")
+    task = {"label": tmp_path / "l.nii.gz", "qsm": tmp_path / "q.nii.gz", "t1": tmp_path / "t1.nii",
+            "support": None, "t1seg": None}
+    opts = {"min_voxels": 1, "min_mm3": 0.0, "min_coverage": 0.0, "csf_ref": False, "min_csf_voxels": 30}
+    r = p9.process_subject(task, KEYS, opts)
+    assert r["qsm_integer_valued"] is False and r["qsm_quantized"] is True
+    assert r["si_extent_mm"] == 6.0
+
+
+def test_protocol_strata():
+    from strata import coverage_group, voxel_size_label
+    assert voxel_size_label("0.8x0.8x0.8") == "0.8x0.8x0.8"
+    assert voxel_size_label((0.859375, 0.859375, 0.8)) == "0.86x0.86x0.8"
+    assert voxel_size_label("") == "unknown"
+    assert coverage_group(124.9) == "short" and coverage_group("125") == "full"
+    assert coverage_group("") == "unknown" and coverage_group(float("nan")) == "unknown"
+
 def test_singleton_4d_qsm_and_support_are_read_as_3d(tmp_path):
     aff = np.diag([-1.0, 1.0, 1.0, 1.0])
     lab = np.full((6, 6, 6), 1001, np.int16)

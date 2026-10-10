@@ -72,6 +72,20 @@ T1_SHA1=$(file_sha1 "$T1")
 # An exported FORCE_RERUN=1 still forces P1, as it did when P1 inherited it.
 P1_FORCE="${P8_FORCE_P1:-${FORCE_RERUN:-0}}"
 
+# Registration settings that change QSM_to_T1.mat. P1 records both in its rigid QC
+# (t1_pixdim=naxnaxna when the T1 is registered at full resolution), so a matrix or label
+# made with other settings is never reused, e.g. by a comparison run with QSM_ROI_T1_SUBSAMP=0.
+REQ_T1_RES=subsampled
+if [[ "${QSM_ROI_T1_SUBSAMP:-2}" == "0" ]]; then REQ_T1_RES=native; fi
+REQ_SEARCH="${QSM_ROI_SEARCH_MODE:-nosearch}"
+# T1 resolution of the registration recorded in a P1 rigid QC file; empty when not recorded.
+p1_t1_resolution() {
+    local pix
+    pix=$(qc_field t1_pixdim "$1")
+    if [[ -z "$pix" ]]; then return 0; fi
+    if [[ "$pix" == "naxnaxna" ]]; then echo native; else echo subsampled; fi
+}
+
 # Print why the existing label cannot be reused for these inputs; no output means it can.
 # A reusable label passed QC with this grid conversion, and the QSM, T1, P1 matrix,
 # segmentation and label are byte-identical to the ones recorded when it was built.
@@ -85,6 +99,10 @@ existing_output_problems() {
     if ! grep -qx "qc_complete=1" "$QC"; then echo "QC file incomplete"; fi
     if ! grep -qx "grid_conversion=${GRID_CONVERSION_TAG}" "$QC"; then
         echo "QC predates grid conversion ${GRID_CONVERSION_TAG}"
+    fi
+    if [[ "$(qc_field p1_t1_resolution "$QC")" != "$REQ_T1_RES" || \
+            "$(qc_field p1_search_mode "$QC")" != "$REQ_SEARCH" ]]; then
+        echo "registration settings (T1 resolution, search mode) differ or were not recorded"
     fi
     if grep -q '^ERROR:' "$QC"; then echo "QC recorded errors"; fi
     if [[ "$(canon_path "$(qc_field qsm "$QC")")" != "$(canon_path "$QSM")" ]]; then echo "QSM path differs"; fi
@@ -216,6 +234,15 @@ if [[ "$P1_FORCE" != "1" && -s "$MAT_Q2T" ]]; then
         P1_PROVENANCE=legacy_path_mtime
     fi
 fi
+if [[ "$P1_FORCE" != "1" && -s "$MAT_Q2T" ]]; then
+    _res=$(p1_t1_resolution "$P1_QC")
+    _search=$(qc_field search_mode "$P1_QC")
+    if [[ "$_res" != "$REQ_T1_RES" || "$_search" != "$REQ_SEARCH" ]]; then
+        echo "  Existing $MAT_Q2T was registered with T1 resolution '${_res:-not recorded}' and search" \
+             "mode '${_search:-not recorded}' (requested ${REQ_T1_RES}, ${REQ_SEARCH}); re-running P1"
+        P1_FORCE=1
+    fi
+fi
 P1_FRESH=0
 if [[ "$P1_FORCE" == "1" || ! -s "$MAT_Q2T" ]]; then
     P1_FRESH=1
@@ -225,7 +252,11 @@ if [[ "$P1_FORCE" == "1" || ! -s "$MAT_Q2T" ]]; then
 fi
 
 echo "[1] Run P1 (STOP_AFTER=rigid, FORCE_RERUN=${P1_FORCE}) to obtain QSM_to_T1.mat ..."
+# P1's Dice gate stops before FNIRT to save time in MNI mode. In rigid mode it would discard
+# the matrix, so a low-Dice scan got no label or QC to inspect. Step [5] applies the same
+# 0.60 gate, so such a scan still fails QC (exit 15 rather than 5) and is still excluded.
 FORCE_RERUN="$P1_FORCE" \
+QSM_ROI_DICE_MIN=0 \
 QSM_ROI_STOP_AFTER=rigid \
 QSM_ROI_KEEP_WORK=1 \
 QSM_ROI_KEEP_DIR="$MAT_DIR" \
@@ -243,7 +274,14 @@ if [[ "$P1_FRESH" == "1" ]]; then
         "$(file_sha1 "$T1_BRAIN")" "$(file_sha1 "$P1_QC")" > "${MAT_SRC}.tmp"
     mv -f "${MAT_SRC}.tmp" "$MAT_SRC"
 fi
-echo "  P1 matrix provenance: ${P1_PROVENANCE}"
+P1_T1_RES=$(p1_t1_resolution "$P1_QC")
+P1_SEARCH=$(qc_field search_mode "$P1_QC")
+if [[ "$P1_T1_RES" != "$REQ_T1_RES" || "$P1_SEARCH" != "$REQ_SEARCH" ]]; then
+    echo "ERROR: P1 QC records T1 resolution '${P1_T1_RES:-none}' and search mode '${P1_SEARCH:-none}';" \
+         "requested ${REQ_T1_RES} and ${REQ_SEARCH}" >&2
+    exit 11
+fi
+echo "  P1 matrix provenance: ${P1_PROVENANCE}; T1 resolution: ${P1_T1_RES}; search mode: ${P1_SEARCH}"
 
 DICE=$(qc_field reg_mask_dice "$P1_QC")
 
@@ -377,6 +415,7 @@ fi
 {
     printf 'qsm_sha1=%s\nt1_sha1=%s\n' "$QSM_SHA1" "$T1_SHA1"
     printf 'p1_matrix_provenance=%s\n' "$P1_PROVENANCE"
+    printf 'p1_t1_resolution=%s\np1_search_mode=%s\n' "$P1_T1_RES" "$P1_SEARCH"
     printf 'q2t_mat_sha1=%s\n' "$(file_sha1 "$MAT_Q2T")"
     printf 't1seg_sha1=%s\n' "$(file_sha1 "$T1SEG")"
     printf 'label_sha1=%s\n' "$(file_sha1 "$FINAL")"
@@ -471,6 +510,7 @@ seg_qsm_dice = (2.0 * inter / float(seg_brain.sum() + nz.sum())
 # so their identifiers retain ".nii" and matching filenames by row ID can fail.
 icv_ml = float("nan")
 ss_left_cortex_ml = float("nan")
+ss_cortex_ml = float("nan")
 vol_csv = Path(vol_p)
 if vol_csv.exists():
     with open(vol_csv, newline="", encoding="utf-8-sig") as fh:
@@ -483,6 +523,9 @@ if vol_csv.exists():
                 return float("nan")
         icv_ml = num("total intracranial")
         ss_left_cortex_ml = num("left cerebral cortex")
+        # Whole-brain cortex of the T1 segmentation; unlike cortex_ml it does not depend on
+        # how much of the brain the QSM slab covers.
+        ss_cortex_ml = ss_left_cortex_ml + num("right cerebral cortex")
 
 # ---------- Compare Dice with archived qc_summary.csv to verify reproducibility of P1 registration ----------
 dice_archive = float("nan")
@@ -501,25 +544,38 @@ if qs.exists() and dice:
         print(f"  WARNING: Could not compare Dice with the archive; ignoring {type(exc).__name__}: {exc}")
 
 # ---------- QC thresholds ----------
-errors, warns = [], []
+# Each failed rule is also recorded by name (qc_failed_rules) so that exclusions can be
+# counted per rule (qc_exclusion_report.py) without parsing the messages.
+errors, warns, failed_rules = [], [], []
+
+def fail_rule(rule, msg):
+    failed_rules.append(rule)
+    errors.append(msg)
+
 try:
     d = float(dice)
     if d < 0.60:
-        errors.append(f"reg_mask_dice={d:.3f} < 0.60")
+        fail_rule("reg_mask_dice", f"reg_mask_dice={d:.3f} < 0.60")
 except (TypeError, ValueError):
     # Step [1] verifies or regenerates P1's QC, so a missing Dice means the registration is unchecked.
-    errors.append(f"reg_mask_dice unavailable (P1 QC missing or incomplete; dice={dice!r})")
+    fail_rule("reg_mask_dice", f"reg_mask_dice unavailable (P1 QC missing or incomplete; dice={dice!r})")
 
 if not np.isnan(icv_ml) and not (1200.0 <= icv_ml <= 1900.0):
-    errors.append(f"SynthSeg ICV={icv_ml:.0f} mL is outside 1200-1900 mL")
+    fail_rule("synthseg_icv", f"SynthSeg ICV={icv_ml:.0f} mL is outside 1200-1900 mL")
 if not (350.0 <= cortex_ml <= 700.0):
-    errors.append(f"Cortical volume={cortex_ml:.0f} mL is outside 350-700 mL (reference P164054=491 mL)")
+    fail_rule("cortex_vol_qsm_grid",
+              f"Cortical volume={cortex_ml:.0f} mL is outside 350-700 mL (reference P164054=491 mL)")
 if ribbon.sum() and ribbon_in_qsm_frac < 0.50:
-    errors.append(f"Only {ribbon_in_qsm_frac:.2f} of the cortical ribbon lies within QSM coverage")
+    fail_rule("ribbon_coverage", f"Only {ribbon_in_qsm_frac:.2f} of the cortical ribbon lies within QSM coverage")
 if not np.isnan(rib_med) and not np.isnan(wm_med) and not (rib_med - wm_med) > 0:
-    errors.append(f"gm_wm_contrast={rib_med - wm_med:+.2f} ppb <= 0 (possible cortical misalignment)")
+    fail_rule("gm_wm_contrast", f"gm_wm_contrast={rib_med - wm_med:+.2f} ppb <= 0 (possible cortical misalignment)")
 if seg_qsm_dice < 0.60:
-    errors.append(f"seg_qsm_dice={seg_qsm_dice:.3f} < 0.60 (label/QSM alignment failed)")
+    fail_rule("seg_qsm_dice", f"seg_qsm_dice={seg_qsm_dice:.3f} < 0.60 (label/QSM alignment failed)")
+# Evaluated but not applied (METHODOLOGICAL_DECISIONS D1): the same 350-700 mL range on the
+# whole-brain T1 cortex, the candidate replacement for the slab-dependent cortex_vol_qsm_grid.
+report_only_failed = []
+if not np.isnan(ss_cortex_ml) and not (350.0 <= ss_cortex_ml <= 700.0):
+    report_only_failed.append("cortex_vol_t1")
 if n_roi_present < 68:
     warns.append(f"Only {n_roi_present}/68 cortical ROIs contain voxels")
 if not np.isnan(dice_delta) and dice_delta > 0.01:
@@ -564,6 +620,7 @@ with open(tmp_qc, "w", encoding="utf-8") as fh:
              else "dice_archive=na\n")
     fh.write(f"synthseg_icv_ml={icv_ml:.0f}\n")
     fh.write(f"synthseg_left_cortex_ml={ss_left_cortex_ml:.1f}\n")
+    fh.write(f"synthseg_cortex_ml={ss_cortex_ml:.1f}\n")
     fh.write(f"cortex_vol_ml={cortex_ml:.1f}\n")
     fh.write(f"n_cortex_labels_present={n_roi_present}\n")
     fh.write(f"min_roi_voxels={min_nvox}\n")
@@ -578,6 +635,8 @@ with open(tmp_qc, "w", encoding="utf-8") as fh:
     fh.write(f"qsm_pixdim_sform_rel_diff={qsm_pixdim_sform_rel_diff:.6f}\n")
     fh.write(f"qsm_scl_slope={qsm_img.header['scl_slope']}\n")
     fh.write(f"qsm_scl_inter={qsm_img.header['scl_inter']}\n")
+    fh.write(f"qc_failed_rules={','.join(failed_rules)}\n")
+    fh.write(f"qc_report_only_failed_rules={','.join(report_only_failed)}\n")
     for w in warns:
         fh.write(f"WARNING: {w}\n")
     for e in errors:

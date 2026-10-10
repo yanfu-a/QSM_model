@@ -5,7 +5,8 @@ FSL, FreeSurfer and real MRI data are not required. The stubs are:
 * flirt -applyxfm -interp nearestneighbour, which maps reference voxels to input voxels
   through FLIRT coordinates using fslpy (FSL's own library), independently of native_grid;
 * mri_synthseg, which copies the subject's prepared segmentation ($FAKE_SEG);
-* a rigid-mode P1 with the real P1's skip rule (matrix kept and FORCE_RERUN != 1 -> exit 0).
+* a rigid-mode P1 with the real P1's skip rule (matrix kept and FORCE_RERUN != 1 -> exit 0),
+  Dice gate (QSM_ROI_DICE_MIN; below it, exit 5 without keeping files) and QC fields.
 Set QSM_TEST_REAL_FSL=1 to use the real flirt and fslinfo on PATH instead of the stubs.
 """
 
@@ -74,7 +75,8 @@ if os.environ.get("FAKE_SYNTHSEG_FAIL") == "1":
 a = sys.argv[1:]
 opt = lambda k: a[a.index(k) + 1]
 shutil.copy(os.environ["FAKE_SEG"], opt("--o"))
-open(opt("--vol"), "w").write("subject,total intracranial,left cerebral cortex\\nx,1500000,215000\\n")
+open(opt("--vol"), "w").write("subject,total intracranial,left cerebral cortex,right cerebral cortex\\n"
+                              "x,1500000,215000,218000\\n")
 open(os.environ["STUB_LOG"], "a").write("synthseg " + opt("--i") + "\\n")
 '''
 
@@ -85,17 +87,22 @@ echo "P1 FORCE_RERUN=${FORCE_RERUN:-unset}" >> "$STUB_LOG"
 if [[ -s "${QSM_ROI_KEEP_DIR}/${ID}_QSM_to_T1.mat" && "${FORCE_RERUN:-0}" != "1" ]]; then exit 0; fi
 mkdir -p "$QSM_ROI_KEEP_DIR" "$QSM_ROI_OUT_DIR"
 QC="${QSM_ROI_OUT_DIR}/${ID}_qc_rigid.txt"
-if [[ "${FAKE_P1_FAIL:-0}" == "1" ]]; then
-    printf 'ID=%s\\nQSM=%s\\nT1=%s\\nreg_mask_dice=0.410\\nWARNING: reg_mask_dice 0.410 < 0.60\\n' "$ID" "$QSM" "$T1" > "$QC"
+if [[ "${FAKE_P1_CRASH:-0}" == "1" ]]; then exit 3; fi
+DICE="${FAKE_P1_DICE:-0.850}"
+# Like the real P1: below its Dice gate it writes a warning QC and exits before keeping files.
+if awk -v d="$DICE" -v g="${QSM_ROI_DICE_MIN:-0.60}" 'BEGIN{exit !(d < g)}'; then
+    printf 'ID=%s\\nQSM=%s\\nT1=%s\\nreg_mask_dice=%s\\nWARNING: reg_mask_dice %s < %s\\n' \\
+        "$ID" "$QSM" "$T1" "$DICE" "$DICE" "${QSM_ROI_DICE_MIN:-0.60}" > "$QC"
     exit 5
 fi
 cp "$FAKE_Q2T" "${QSM_ROI_KEEP_DIR}/${ID}_QSM_to_T1.mat"
 cp "$FAKE_T1BRAIN" "${QSM_ROI_KEEP_DIR}/${ID}_T1_brain.nii.gz"
-if [[ "${FAKE_NO_DICE:-0}" == "1" ]]; then
-    printf 'ID=%s\\nQSM=%s\\nT1=%s\\nstop_after=rigid\\n' "$ID" "$QSM" "$T1" > "$QC"
-else
-    printf 'ID=%s\\nQSM=%s\\nT1=%s\\nstop_after=rigid\\nreg_mask_dice=0.850\\n' "$ID" "$QSM" "$T1" > "$QC"
-fi
+if [[ "${QSM_ROI_T1_SUBSAMP:-2}" == "0" ]]; then PIX=naxnaxna; else PIX=2.000000x2.000000x2.000000; fi
+{
+    printf 'ID=%s\\nQSM=%s\\nT1=%s\\nstop_after=rigid\\nt1_pixdim=%s\\n' "$ID" "$QSM" "$T1" "$PIX"
+    if [[ "${FAKE_NO_DICE:-0}" != "1" ]]; then printf 'reg_mask_dice=%s\\n' "$DICE"; fi
+    printf 'search_mode=%s\\n' "${QSM_ROI_SEARCH_MODE:-nosearch}"
+} > "$QC"
 '''
 
 

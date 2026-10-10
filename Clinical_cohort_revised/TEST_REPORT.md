@@ -16,8 +16,9 @@ pytest 9.1.1, fslpy 3.29.1, GNU bash 5.2.
   library. It is independent of `native_grid.py`.
 - **`fslinfo`:** reads the header with nibabel.
 - **`mri_synthseg`:** copies a prepared segmentation.
-- **P1 (rigid mode):** a fake with the real P1's skip rule that writes the true
-  registration matrix.
+- **P1 (rigid mode):** a fake with the real P1's skip rule and Dice gate (`QSM_ROI_DICE_MIN`).
+  It writes the true registration matrix and the same QC fields as the real P1
+  (`reg_mask_dice`, `t1_pixdim`, `search_mode`).
 
 **Synthetic subjects** (`tests/synth.py`) are ellipsoidal brains with the 68 Desikan parcels,
 WM and ventricles. Each has a ground-truth label on the QSM grid, obtained by sampling the
@@ -39,15 +40,16 @@ QSM_TEST_REAL_FSL=1 python -m pytest Clinical_cohort_revised/tests -v           
 | Suite | Tests | Passed | Skipped | Failed |
 |---|---|---|---|---|
 | `test_native_grid.py` (FLIRT conventions) | 9 | 9 | 0 | 0 |
-| `test_p9_unit.py` (extraction, gates, parsing) | 26 | 26 | 0 | 0 |
-| `test_support_masks.py` | 4 | 4 | 0 | 0 |
-| `test_p8.py` (P8 end to end, stubs) | 18 | 18 | 0 | 0 |
+| `test_p9_unit.py` (extraction, gates, parsing, zero counts, quantization, strata) | 29 | 29 | 0 | 0 |
+| `test_support_masks.py` | 5 | 5 | 0 | 0 |
+| `test_p8.py` (P8 end to end, stubs) | 22 | 22 | 0 | 0 |
 | `test_geometry.py` (7 geometries, revised vs original P8) | 15 | 15 | 0 | 0 |
-| `test_p9_integration.py` (24-subject synthetic cohort) | 9 | 9 | 0 | 0 |
+| `test_p9_integration.py` (24-subject synthetic cohort) | 11 | 11 | 0 | 0 |
+| `test_reports.py` (QC exclusion report, run comparison) | 3 | 3 | 0 | 0 |
 | `test_fsl_real.py` (needs FSL) | 6 | 0 | 6 | 0 |
-| **Total** | **87** | **81** | **6** | **0** |
+| **Total** | **100** | **94** | **6** | **0** |
 
-The full run took 156 s. Static checks:
+The full run took 226 s (revision 4). Static checks:
 - `bash -n` on P8: clean.
 - `shellcheck -S warning`: one pre-existing, intentional SC2163 (exporting variables by
   name).
@@ -78,6 +80,15 @@ The full run took 156 s. Static checks:
 | P8 verified reuse and invalidation | `test_p8` (8 invalidation cases, verified skip, legacy matrix) | Rebuild only when needed; P1 and SynthSeg reused only when verified | As expected |
 | Interrupted and failed runs | `test_failure_after_cleanup...`, `test_failed_registration_removes_matrix_record`, `test_missing_registration_dice_fails_qc` | No stale QC, label or matrix record; a missing Dice fails QC and is not skipped later | As expected |
 | Concurrent runs | `test_concurrent_run_is_refused` | Exit 16 while another run holds the lock | As expected |
+| Low registration Dice (revision 4, CR-18) | `test_p8::test_low_registration_dice_keeps_label_and_fails_qc` | Label and complete QC are written; QC fails `reg_mask_dice`, as before (exit 15); not reused later | As expected |
+| Per-rule QC record (CR-18) | `test_p8::test_fresh_run...` (`qc_failed_rules` empty, `synthseg_cortex_ml`); `test_reports::test_report_reads_p8_qc_files` | Rule names recorded, read by the report | As expected |
+| Exclusions per rule and stratum (CR-18) | `test_reports::test_exclusions_are_counted_per_rule_and_stratum` (7 scans, every stage, sex covariate) | Hand-computed counts per rule, stratum, "alone" and cortex-rule comparison | As expected |
+| Zero-valued voxels inside and outside support (CR-19) | `test_p9_unit::test_zero_valued_voxels...`; integration `test_report_columns_and_missingness_table` | Exact counts; statistics unchanged | As expected |
+| Quantized QSM with `scl_slope` (CR-19) | `test_p9_unit::test_scaled_integer_qsm_is_reported_as_quantized`; `test_support_masks::test_quantization_is_recorded...` | int16 x 0.001: `qsm_integer_valued=False`, `qsm_quantized=True`; filled holes in float QSM flagged | As expected |
+| ROI missingness by stratum (CR-20) | integration `test_report_columns_and_missingness_table` | 68 rows per stratum; missing fraction = 1 - reported / analysis set | As expected |
+| Main-model selection (CR-21) | integration `test_main_model_only` | Without the option, a note; with it, other rows excluded with reason | As expected |
+| Registration settings provenance (CR-22) | `test_p8::test_registration_settings_are_recorded_and_enforced`, `test_legacy_p1_qc_without_settings_is_re_registered`, invalidation case "registration settings" | A changed T1 resolution or search mode re-registers and rebuilds; unchanged settings skip; unrecorded settings re-register | As expected |
+| Paired run comparison (CR-19, CR-22) | `test_reports::test_compare_p9_runs` | Hand-computed differences, r, gained/lost values, strata | As expected |
 
 ## 4. Bugs reproduced on the audited code (915e78b) and resolved
 
@@ -134,7 +145,10 @@ made:
 | SynthSeg `--parc --keepgeom` labels on real T1 (label set, insula, geometry) | FreeSurfer 8.2 + MRI data | Pilot. P9 checks `synthseg_parcellation_labels.npy` and the LUT at run time |
 | Label placement on real anatomy, especially lateral cortex in both hemispheres | Real data | Pilot visual QC (overlays) per geometry stratum |
 | Contents of the real `failed_ID.txt` and P1 QC files (stage classification) | Cluster files | Pilot: review `P1_failure_stage` and `P1_failure_evidence` |
-| Real QSM storage (float vs integer) and units; whether reconstruction masks exist | Real data / scanner documentation | `support_masks_summary.csv` (`qsm_dtype`, `qsm_integer_valued`); D3, D4 |
+| Real QSM storage (float vs integer) and units; whether reconstruction masks exist | Real data / scanner documentation | `support_masks_summary.csv` (`qsm_dtype`, `qsm_quantized`); D3, D4 |
+| Exclusions per QC rule by protocol, diagnosis and sex | P8 on the cohort + demographics | `qc_exclusion_report.py` with `--covariates` (D1) |
+| Effect of downsampled-T1 registration on ROI values and ribbon placement | FSL + MRI data | Full-resolution comparison run and overlays (README "Sensitivity analyses"; D12) |
+| Effect of the support-mask hole limit on ROI values | Real data | `--max-hole-mm3 0` run and `compare_p9_runs.py` (D3) |
 | `flock` behaviour on the cluster's network file system | Cluster | Run two P8 jobs for one ID; the second should exit 16 |
 | Memory and time at cohort scale (705 subjects, 16 threads) | Cluster | Pilot timing; README memory note |
 | Clinical validity of QC thresholds and coverage rules | Real cohort | METHODOLOGICAL_DECISIONS D1-D2 |

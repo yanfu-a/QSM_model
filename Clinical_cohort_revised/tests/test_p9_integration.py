@@ -187,6 +187,44 @@ def test_provenance_columns(formal):
     assert not qc.loc["FAILMNI", "repeat_patient"]
 
 
+def test_report_columns_and_missingness_table(formal):
+    out, log = formal
+    qc = pd.read_csv(out / "HUASHAN_NATIVE_DK_qc.csv", dtype={"IID": str}, keep_default_na=False).set_index("IID")
+    ok = qc.loc["OK1"]
+    assert ok["P8_qc_failed_rules"] == "" and ok["P8_qc_report_only_failed_rules"] == ""
+    assert ok["P8_p1_t1_resolution"] == "subsampled" and ok["P8_p1_search_mode"] == "nosearch"
+    assert float(ok["P8_synthseg_cortex_ml"]) == 433.0
+    assert ok["qsm_protocol"] == "1x1x1" and ok["qsm_coverage_group"] == "full"
+    assert str(ok["qsm_quantized"]) == "False" and float(ok["cortex_valid_zero_fraction"]) == 0.0
+    cov = pd.read_csv(out / "native_roi_coverage.csv")
+    assert {"valid_zero_voxels", "unsupported_zero_voxels"} <= set(cov.columns)
+    miss = pd.read_csv(out / "native_roi_missingness.csv")
+    n_pass = int(qc["analysis_pass"].astype(str).eq("True").sum())
+    overall = miss[miss["stratum"] == "all"]
+    assert len(overall) == 68 and (overall["n_subjects"] == n_pass).all()
+    assert set(miss["stratum"]) == {"all", "1x1x1 | full"}
+    assert (overall["missing_fraction"] == 1 - overall["n_reported"] / n_pass).all()
+    assert "Analysis-set subjects with all 68 ROI values" in log
+
+
+def test_main_model_only(cohort, fs_fixtures, tmp_path):
+    wl = pd.read_csv(cohort["worklist"], dtype=str).fillna("")
+    wl.loc[wl["image_dir_id"] == "REP", "include_main_model"] = "no"
+    wl.to_csv(tmp_path / "wl.csv", index=False)
+    ids = tmp_path / "ids.csv"
+    pd.DataFrame({"IID": ["OK1", "REP"]}).to_csv(ids, index=False)
+    args = ["--support-dir", cohort["support"], "--ids-file", ids, *cohort["common"]]
+    code, log = run_p9(fs_fixtures, cohort["native"], tmp_path, tmp_path / "wl.csv", *args)
+    assert code == 0, log
+    assert "1 analysis-set subjects have include_main_model other than 'yes'" in log
+    code, log = run_p9(fs_fixtures, cohort["native"], tmp_path, tmp_path / "wl.csv", *args,
+                       "--main-model-only", "--suffix", "_main")
+    assert code == 0, log
+    assert list(pd.read_csv(tmp_path / "HUASHAN_NATIVE_DK_main_qc.csv")["IID"]) == ["OK1"]
+    excl = pd.read_csv(tmp_path / "HUASHAN_NATIVE_DK_main_excluded.csv").set_index("IID")["reason"]
+    assert excl["REP"] == "worklist include_main_model='no' (--main-model-only)"
+
+
 def test_csf_reference_does_not_change_the_primary_set(formal, cohort, fs_fixtures):
     out, _ = formal
     qc = pd.read_csv(out / "HUASHAN_NATIVE_DK_qc.csv").set_index("IID")

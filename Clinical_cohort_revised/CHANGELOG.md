@@ -8,7 +8,43 @@ Each change is marked for whether it can affect:
 
 "yes" means the change can alter that quantity for some subjects; "no" means it cannot.
 
-## Revision 3 (this revision): independent audit and provenance hardening
+## Revision 4 (this revision): response to the external review (CODE_REVIEW CR-18 to CR-22)
+
+No threshold, inclusion rule, support definition or ROI statistic changed. With identical
+inputs and options, `analysis_pass` and ROI values equal those of revision 3. Exit codes
+are the one exception: a scan below P8's Dice gate now exits 15 with a label, not 5.
+
+### P8 (`P8_native_aparc_qsm_ALL.sh`)
+
+| Change | Values | ROIs | QC | N |
+|---|---|---|---|---|
+| P1 runs with its Dice gate off (`QSM_ROI_DICE_MIN=0`) in rigid mode. P8's own 0.60 gate still fails such scans, which now get a label and full QC (exit 15, not 5) (CR-18) | no | no | no (same rule) | no |
+| `qc_failed_rules` and `qc_report_only_failed_rules` recorded; `synthseg_cortex_ml` and the report-only `cortex_vol_t1` rule added (CR-18) | no | no | no | no |
+| Registration settings (T1 resolution, search mode) compared with P1's rigid QC before a matrix or label is reused; `p1_t1_resolution`, `p1_search_mode` recorded. Labels without them are rebuilt once, reusing verified matrices (CR-22) | no | no | no | no |
+
+### P9 (`P9_extract_native_qsm_ALL.py`)
+
+| Change | Values | ROIs | QC | N |
+|---|---|---|---|---|
+| `--main-model-only` option (default off); note when the analysis set includes other rows (CR-21) | no | no | no | only with the option |
+| Coverage table: `valid_zero_voxels`, `unsupported_zero_voxels`. QC table: `cortex_valid_zero_fraction`, `cortex_unsupported_zero_voxels`, `qsm_quantized`, `qsm_protocol`, `qsm_fov_si_mm`, `qsm_coverage_group`, and P8's `qc_failed_rules`, `qc_report_only_failed_rules`, `synthseg_cortex_ml`, `p1_t1_resolution`, `p1_search_mode` (CR-18, CR-19) | no | no | no | no |
+| New `native_roi_missingness*.csv` and complete-case counts per protocol stratum (CR-20) | no | no | no | no |
+
+### Other
+
+- **`make_support_masks.py`:** records `qsm_quantized`, and warns when holes were filled in
+  non-quantized QSM (CR-19). Masks are unchanged.
+- **New `qc_exclusion_report.py`:** exclusions per rule by protocol, coverage, diagnosis
+  and covariates (CR-18).
+- **New `compare_p9_runs.py`:** paired comparison of two P9 runs (CR-19, CR-22).
+- **New `strata.py`:** protocol strata shared with `select_pilot.py` (whose output is
+  unchanged).
+- **Tests:** stub P1 now applies the Dice gate and records `t1_pixdim` and `search_mode`
+  like the real P1; tests added for every change (`TEST_REPORT.md`).
+- **Documents:** CODE_REVIEW (CR-18 to CR-22), METHODOLOGICAL_DECISIONS (D1-D3 updated, D11
+  and D12 added), README (sensitivity analyses).
+
+## Revision 3 (`f32283c`): independent audit and provenance hardening
 
 ### P9 (`P9_extract_native_qsm_ALL.py`)
 

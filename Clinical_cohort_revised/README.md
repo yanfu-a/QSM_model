@@ -18,6 +18,9 @@ P1 (rigid QSM->T1, run by P8) -> P8 (SynthSeg + label on the QSM grid + QC)
 | `make_support_masks.py` | Support masks `<IID>_support.nii.gz` with provenance records `<IID>_support.json` |
 | `P9_extract_native_qsm_ALL.py` | Cohort ROI extraction, analysis eligibility, QC tables, run provenance |
 | `select_pilot.py` | Picks representative pilot scans by image geometry |
+| `strata.py` | Protocol strata (QSM voxel size, short/full coverage) shared by the scripts |
+| `qc_exclusion_report.py` | Counts P8 QC exclusions per rule by protocol, coverage, diagnosis and sex (report only) |
+| `compare_p9_runs.py` | Compares two P9 runs ROI by ROI (sensitivity analyses) |
 | `check_grid_conversion.py` | Audits existing (historical) labels for the former grid-conversion error |
 | `tests/` | Regression tests (pytest); see `TEST_REPORT.md` |
 | `CODE_REVIEW.md`, `TEST_REPORT.md`, `METHODOLOGICAL_DECISIONS.md`, `CHANGELOG.md` | Review, test results, decisions awaiting approval, change log |
@@ -96,6 +99,10 @@ $PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-d
     --failed-list failed_ID.txt --p1-qc-dir $P1QC --ids-file pilot_ids.csv --suffix _pilot \
     --out-dir output --jobs 8
 
+# QC exclusions per rule and stratum; add --covariates demographics.csv (IID or hospital_id, sex)
+$PY qc_exclusion_report.py --worklist $WL --native-dir $NATIVE --ids-file pilot_ids.csv \
+    --out-dir output/qc_report_pilot
+
 # Optional, on the cluster: run the real-FSL checks
 python -m pytest tests -m fsl -v
 ```
@@ -110,12 +117,19 @@ python -m pytest tests -m fsl -v
   as a label overlay. The ribbon should lie on cortex in both hemispheres, at the top and
   bottom of the slab.
 - **Support masks** (`$NATIVE/support/support_masks_summary.csv`): note `support_type`,
-  `qsm_dtype` and `qsm_integer_valued`, and check that `filled_voxels` is small.
+  `qsm_dtype` and `qsm_quantized`, and check that `filled_voxels` is small. Pay particular
+  attention to non-quantized maps, for which `make_support_masks.py` warns.
 - **P9 QC** (`output/HUASHAN_NATIVE_DK_pilot_qc.csv`): review `analysis_pass`,
   `fail_reasons`, `n_reportable_rois`, `P1_failure_stage`, `P8_cortex_vol_ml` vs
   `t1_cortex_ml`, and `max_fov_fraction`.
 - **Coverage** (`output/native_roi_coverage_pilot.csv`): `coverage_vs_t1` and
-  `fov_fraction` by ROI and stratum. Short slabs lose superior and inferior ROIs.
+  `fov_fraction` by ROI and stratum. Short slabs lose superior and inferior ROIs. Also look
+  at `valid_zero_voxels` and `unsupported_zero_voxels`, the zeros counted as values and
+  those left out as padding.
+- **Missingness** (`output/native_roi_missingness_pilot.csv`): missing fraction per ROI and
+  protocol stratum.
+- **QC rules** (`output/qc_report_pilot/`): exclusions per rule and stratum, and the
+  QSM-grid versus T1 cortex-volume rule (decision D1).
 - **Decisions:** settle D1-D10 in `METHODOLOGICAL_DECISIONS.md` before the full run.
 
 ## 2. Native-space extraction (after the pilot and decisions)
@@ -138,6 +152,8 @@ $PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-d
 ```
 
 **Options:**
+- `--main-model-only`: only `include_main_model=yes` rows (D11). Without it, every runnable
+  row is processed and `include_main_model` is a column of every table.
 - `--min-reportable-rois 68`: complete cases only (D2).
 - `--csf-ref`: adds CSF-referenced tables. They have their own `csfref_analysis_pass` and
   never change `analysis_pass`.
@@ -151,6 +167,7 @@ $PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-d
 - `*_excluded.csv`;
 - `*_run_info.json`;
 - `native_roi_coverage.csv` (per subject and ROI);
+- `native_roi_missingness.csv` (analysis set, per ROI and protocol stratum);
 - `native_label_mapping.csv`;
 - `native_mask_voxel_counts.csv`;
 - with `--csf-ref`: `*_csfref.csv` and `*_csfref_analysis.csv`.
@@ -161,6 +178,40 @@ be verified. Afterwards, verified subjects are skipped in seconds.
 
 Peak P9 memory is roughly `--jobs` x 0.4 GB, because each subject's T1-space segmentation is
 read for coverage.
+
+## Sensitivity analyses
+
+Each variant goes into its own directory and suffix, so primary outputs are never
+overwritten. `compare_p9_runs.py` reports, per ROI and protocol stratum:
+- values gained or lost;
+- the mean and SD of the difference B - A;
+- the mean and maximum absolute difference, and Pearson r.
+
+```bash
+# Support-mask hole limit (D3): 0 = no hole filling
+$PY make_support_masks.py --worklist $WL --out-dir $NATIVE/support_h0 --max-hole-mm3 0
+$PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-dir $NATIVE/support_h0 \
+    --failed-list failed_ID.txt --p1-qc-dir $P1QC --suffix _h0 --out-dir output --jobs 8
+$PY compare_p9_runs.py --a output/HUASHAN_NATIVE_DK_analysis.csv --b output/HUASHAN_NATIVE_DK_h0_analysis.csv \
+    --qc output/HUASHAN_NATIVE_DK_qc.csv --out output/compare_hole0.csv
+
+# Registration at full T1 resolution (D12), in a second native root
+NATIVE_FULL=/cwStorage/nodecw_group/FY_data/QSM_HUASHAN/native_data_t1full
+while IFS=$'\t' read -r qsm t1 iid; do
+    QSM_ROI_NATIVE_ROOT=$NATIVE_FULL QSM_ROI_T1_SUBSAMP=0 bash P8_native_aparc_qsm_ALL.sh "$qsm" "$t1" "$iid"
+done < pilot_jobs.tsv
+$PY make_support_masks.py --worklist $WL --ids-file pilot_ids.csv --out-dir $NATIVE_FULL/support
+$PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE_FULL --support-dir $NATIVE_FULL/support \
+    --failed-list failed_ID.txt --p1-qc-dir $P1QC --ids-file pilot_ids.csv --suffix _pilot_t1full \
+    --out-dir output --jobs 8
+$PY compare_p9_runs.py --a output/HUASHAN_NATIVE_DK_pilot_analysis.csv \
+    --b output/HUASHAN_NATIVE_DK_pilot_t1full_analysis.csv --qc output/HUASHAN_NATIVE_DK_pilot_qc.csv \
+    --out output/compare_t1full_pilot.csv
+```
+
+P8 records the registration's T1 resolution and search mode (`p1_t1_resolution`,
+`p1_search_mode`). It never reuses a matrix or label made with other settings, even in the
+same native root.
 
 ## Support masks
 
@@ -188,6 +239,16 @@ masks whose record does not verify.
 - `P8_FORCE_SYNTHSEG=1`: rerun SynthSeg.
 - `P8_PYTHON`, `P8_FREESURFER_HOME`, `P8_P1_SCRIPT`: path overrides.
 - `P8_SYNTHSEG_THREADS`: SynthSeg thread count.
+- `QSM_ROI_T1_SUBSAMP=0`: register to the full-resolution T1 (default: downsampled).
+- `QSM_ROI_SEARCH_MODE`: P1 search mode (default `nosearch`).
+
+These two settings are recorded and checked before any reuse. `QSM_ROI_SEARCH_DEG` is not
+recorded, so use `P8_FORCE_P1=1` after changing it. P1's own Dice gate (`QSM_ROI_DICE_MIN`)
+is disabled inside P8, which applies its 0.60 gate in the QC step instead.
+
+**QC record:** `qc_failed_rules` names the failed rules, and `qc_report_only_failed_rules`
+names the failures of rules that are evaluated but not applied. See
+`qc_exclusion_report.py`.
 
 **Exit codes:**
 
@@ -197,7 +258,7 @@ masks whose record does not verify.
 | 1 | Setup error |
 | 2 | Missing input |
 | 4 | Non-scalar QSM |
-| 5 | P1 rigid Dice below its gate |
+| 5 | P1 rigid Dice below its gate (no longer raised: P8 disables that gate, so such a scan exits 15) |
 | 11 | P1 outputs missing |
 | 12 | Grid-conversion or label-grid error |
 | 13 | SynthSeg failure |

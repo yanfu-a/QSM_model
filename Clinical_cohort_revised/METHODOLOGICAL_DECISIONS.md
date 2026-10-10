@@ -30,9 +30,26 @@ Each decision lists the columns to examine.
 - (d) Report Dice, ribbon coverage and the volume checks, and gate only on gross failures,
   with visual QC for borderline cases.
 
-**Recommendation.** Before fixing thresholds, tabulate on the pilot and then the full
-cohort how many subjects each threshold excludes, by protocol (`qsm_pixdim`,
-`qsm_coverage_mm`), sex and diagnosis.
+**Registration Dice and slab coverage.** Suppose registration is perfect, the slab holds a
+fraction c of the T1 BET brain, and a fraction e of that is non-zero QSM. Then
+`reg_mask_dice` = 2ec / (1 + ec). With e = 0.73 (P1's estimate), Dice < 0.60 once c < 0.59,
+so the shortest slabs can fail the gate with correct registration. `seg_qsm_dice` and ribbon
+coverage are computed on the QSM grid and do not depend on slab coverage.
+
+**Now recorded (revision 4).**
+- P8 writes `qc_failed_rules`, the rule names: `reg_mask_dice`, `synthseg_icv`,
+  `cortex_vol_qsm_grid`, `ribbon_coverage`, `gm_wm_contrast`, `seg_qsm_dice`.
+- P8 writes `synthseg_cortex_ml`, the whole-brain T1 cortex volume.
+- P8 writes `qc_report_only_failed_rules=cortex_vol_t1`: the same 350-700 mL range applied
+  to that volume, evaluated and not applied.
+- P1 no longer stops at its Dice gate inside P8. A low-Dice scan keeps its label and full
+  QC, and still fails the same 0.60 rule.
+
+**Recommendation.** Before fixing thresholds, run `qc_exclusion_report.py` on the pilot,
+then the full cohort. Pass sex with `--covariates`, because the worklist has no sex column.
+- `qc_exclusions_by_rule.csv`: how many scans each rule excludes, and how many it excludes
+  alone, by protocol, coverage, diagnosis and sex.
+- `qc_cortex_rule_comparison.csv`: how many scans option (b) would rescue or newly exclude.
 
 Columns: `P8_native_qc_errors`, `P8_cortex_vol_ml`, `t1_cortex_ml`, `P8_synthseg_icv_ml`,
 `P8_reg_mask_dice`, `P8_ribbon_in_qsm_frac`, `P8_gm_wm_contrast_ppb`.
@@ -75,6 +92,14 @@ short-coverage protocol, which is enriched for AD and DLB.
 
 Please confirm which model the extraction feeds.
 
+**Missingness by protocol (revision 4).** `native_roi_missingness*.csv` gives, per ROI,
+overall and per protocol stratum (QSM voxel size | short/full coverage):
+- the number of analysis-set subjects and the number with a value;
+- the missing fraction and the median `coverage_vs_t1`.
+
+P9 also prints complete-case counts per stratum. Use these to choose the completeness rule
+or imputation model, and to check whether missingness differs by protocol.
+
 ## D3. QSM support masks
 
 **Current behaviour.** Formal extraction requires `--support-dir` with masks that carry a
@@ -114,16 +139,35 @@ background. For quantized QSM, an estimated mask therefore undercounts valid cor
 whose value is exactly 0. This shifts ROI statistics away from 0 for ROIs with values near
 0.
 
+**Holes in non-quantized QSM.** An exact 0.0 is essentially never a reconstructed value in
+float QSM. A filled hole there is therefore more likely tissue the reconstruction masked out
+than a genuine zero. `make_support_masks.py` now warns when this happens; check
+`filled_voxels` for those maps.
+
+**Now reported (revision 4).**
+- `qsm_quantized`: stored as integers (any `scl_slope`) or integer-valued.
+  `qsm_integer_valued` missed int16 data with a slope such as 0.001.
+- Per ROI: `valid_zero_voxels` and `unsupported_zero_voxels`.
+- Per subject: `cortex_valid_zero_fraction` and `cortex_unsupported_zero_voxels`.
+
+**Sensitivity analysis.**
+1. Rebuild the masks with `--max-hole-mm3 0` (and e.g. 50) into another directory.
+2. Run P9 on them with `--suffix`.
+3. Compare the result with the primary run using `compare_p9_runs.py` (README).
+
 **Options.**
 - (a) Obtain the reconstruction masks from the scanner or reconstruction pipeline. This is
   preferred.
 - (b) Use estimated masks for float QSM, where they equal the nonzero proxy and the
   limitation does not arise.
 - (c) For integer QSM without reconstruction masks, treat results as a sensitivity
-  analysis, or report `qsm_integer_valued` and model it.
+  analysis, or report `qsm_quantized` and model it.
+- (d) Use a hole limit of 0 for non-quantized QSM, where filled holes cannot be genuine
+  zeros, and keep 10 mm3 for quantized QSM.
 
-Columns: `support_type`, `qsm_dtype`, `qsm_integer_valued`, `support_masks_summary.csv`
-(`filled_voxels`), `qsm_nonzero_outside_support`.
+Columns: `support_type`, `qsm_dtype`, `qsm_quantized`, `support_masks_summary.csv`
+(`filled_voxels`), `qsm_nonzero_outside_support`, `valid_zero_voxels`,
+`unsupported_zero_voxels`.
 
 ## D4. QSM units, scaling and reference
 
@@ -223,3 +267,43 @@ P8 now reports these, and warns above 1%:
 
 These are not QC failures. Decide after the pilot whether either should become one. Subject
 00413156 (reported 1.83 mm slices) is the known candidate.
+
+## D11. Main-model cohort (`include_main_model`)
+
+**Current behaviour.**
+- P9 processes every `runnable=yes` row and carries `include_main_model` into its tables.
+- 232 of 711 runnable rows are not in the main model. They include 119 without
+  `model_label`, plus MCI, other neurological and vascular groups.
+- `--main-model-only` (revision 4) restricts P9 to `include_main_model=yes` and lists the
+  other rows in `*_excluded.csv`.
+- Without it, P9 prints how many analysis-set subjects are outside the main model.
+
+**Options.**
+- (a) Keep the default. Run the main analysis with `--main-model-only` (with `--suffix`),
+  and use the full run for secondary analyses.
+- (b) Make `--main-model-only` the default.
+
+**Recommendation:** (a), unless the full runnable set is never used. Either way, pass the
+same option to `qc_exclusion_report.py`.
+
+## D12. T1 resolution of the QSM->T1 registration
+
+**Current behaviour.**
+- P1 registers the QSM to the T1 downsampled by `fslmaths -subsamp2` (about 2 mm).
+- P8 composes the matrix with the full-resolution grid conversion. Labels come from the
+  full-resolution SynthSeg, and extraction stays on the native QSM grid.
+- The downsampled reference limits registration precision. A millimetre of misalignment
+  matters for a 2-3 mm cortical ribbon, and whole-brain Dice cannot detect it.
+
+**Comparison (pilot).**
+1. Run P8 with `QSM_ROI_T1_SUBSAMP=0` into a second `QSM_ROI_NATIVE_ROOT`. P8 now records
+   the registration resolution and never reuses a matrix or label made with other settings.
+2. Run `make_support_masks.py` and P9 on that root.
+3. Compare the two P9 runs with `compare_p9_runs.py`.
+4. Inspect label overlays for both resolutions in each stratum.
+
+**Options.**
+- (a) Keep the downsampled registration if ROI differences are small relative to
+  between-subject variation.
+- (b) Register at full resolution (`QSM_ROI_T1_SUBSAMP=0`) for the whole cohort. This
+  costs a slower rigid registration per subject.

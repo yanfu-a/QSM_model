@@ -354,3 +354,133 @@ which uses repeat scans, is the actual reliability estimate.
 - **CR-17 (methodological):** re-scanned patients (13 hospital_ids with two scans) enter
   the analysis set twice. They are flagged by `repeat_patient`; which scan to analyse is
   decision D6.
+
+## External review of revision 3 (round 4)
+
+Five comments from an external static review were checked against the code (commit
+`271576d`) and the worklist. Each verdict says whether the comment is technically correct,
+and what changed. No threshold, inclusion rule, support definition or ROI statistic was
+changed. Every change reports, records or adds an option, and the defaults are unchanged.
+
+| ID | Comment | Verdict | Change |
+|---|---|---|---|
+| CR-18 | P8 QC thresholds and P1's early Dice stop decide inclusion | Correct, with two corrections (below) | Per-rule QC record; P1 early stop removed (same exclusions); exclusion report by stratum |
+| CR-19 | Estimated support is not the reconstruction domain | Correct (already CR-09/D3); the hole-filling half matters most for float QSM | Per-ROI zero counts, `qsm_quantized`, float-hole warning, run comparison tool |
+| CR-20 | `--min-reportable-rois 1` does not give complete cases | Correct (already D2) | ROI missingness table by protocol stratum; complete-case count |
+| CR-21 | P9 ignores `include_main_model` | Correct | `--main-model-only`; note when the analysis set holds other rows |
+| CR-22 | Registration uses a downsampled T1 | Claims correct; a related provenance bug found | Registration settings checked before reuse and recorded; comparison workflow |
+
+### CR-18 QC thresholds and the P1 Dice stop (correct with corrections; reporting changes)
+
+**What is correct:**
+- **Cortex volume (350-700 mL):** it is measured on the QSM grid, so it falls with slab
+  coverage. 250 of 711 runnable scans (172 of 479 main-model rows) have less than 125 mm.
+  This is the clearest case of a rule that tests field of view rather than segmentation.
+- **ICV (1200-1900 mL):** it depends on head size and therefore on sex.
+- **`reg_mask_dice` (P1, gate 0.60):** it compares the QSM non-zero mask with the BET mask of
+  the whole T1. Suppose registration is perfect, the slab holds a fraction c of the BET
+  brain, and a fraction e of that is non-zero QSM. Then Dice = 2ec / (1 + ec). With P1's own
+  estimate e = 0.73, Dice falls below 0.60 once c < 0.59. A short slab can fail this gate
+  with correct registration.
+- **P1's early stop:** this was worse than the comment says. In rigid mode, P1 exited before
+  keeping the matrix, so P8 stopped with exit 5. The scan had no label and no QC metrics,
+  could not be inspected, and could not be counted under any other rule. Also,
+  `QSM_ROI_DICE_MIN` could change native-branch inclusion through P1, while P8's own gate
+  was fixed at 0.60.
+
+**What needs correcting:**
+- `seg_qsm_dice` and ribbon coverage are computed on the QSM grid. Cortex outside the slab
+  is not on that grid, so slab truncation does not lower them. Only reconstruction erosion
+  and genuine zeros do.
+- A ribbon with less than half of its voxels non-zero also means unreliable cortical QSM.
+  That rule is not only a registration check.
+
+**Changes:**
+- P8 runs P1 with `QSM_ROI_DICE_MIN=0` in rigid mode. Step [5] still applies
+  `reg_mask_dice < 0.60`, so a low-Dice scan is excluded exactly as before. It now exits 15
+  with a label and full QC instead of 5 with nothing.
+- P8 records:
+  - `qc_failed_rules`, the machine-readable names of the failed rules;
+  - `synthseg_cortex_ml`, the cortex volume of the whole-brain T1 segmentation;
+  - `qc_report_only_failed_rules=cortex_vol_t1`, which applies the same 350-700 mL range to
+    `synthseg_cortex_ml`. This rule is evaluated but not applied.
+- New `qc_exclusion_report.py` counts, for each rule, the scans evaluated, failed, and
+  failed by that rule alone. It reports these overall and by protocol, coverage, diagnosis
+  and any covariate (sex via `--covariates`). It also compares the QSM-grid and T1 cortex
+  rules.
+- Thresholds are unchanged (decision D1).
+
+### CR-19 Support masks and zero-valued voxels (correct; reporting changes)
+
+**The comment restates CR-09/D3:**
+- An estimated support cannot tell genuine zeros touching the brain edge from padding.
+- It fills enclosed zero holes up to 10 mm3.
+
+**The second point is the more important one for non-quantized QSM:**
+- An exact 0.0 is essentially never a reconstructed value there.
+- So a filled hole is more likely tissue the reconstruction masked out than a genuine zero.
+
+**Reporting gap found:** `qsm_integer_valued` missed quantized data stored as integers with
+a non-unit `scl_slope` (e.g. int16 at 0.001 ppm), since the scaled values are not integers.
+
+**Changes:**
+- `native_roi_coverage*.csv` gains `valid_zero_voxels` (zeros counted as values) and
+  `unsupported_zero_voxels` (zeros left out as padding).
+- `*_qc.csv` gains `cortex_valid_zero_fraction` and `cortex_unsupported_zero_voxels`.
+- P9 and the support records report `qsm_quantized`, meaning stored as integers or
+  integer-valued.
+- `make_support_masks.py` warns when holes were filled in non-quantized QSM.
+- New `compare_p9_runs.py` compares a run at another `--max-hole-mm3` with the primary run,
+  ROI by ROI and by stratum.
+- The support definition is unchanged (decision D3).
+
+### CR-20 Completeness of ROI values (correct; reporting change)
+
+- With `--min-reportable-rois 1`, `*_analysis.csv` holds subjects with missing ROIs.
+- A partially covered ROI (coverage of at least 0.5) is summarised over its covered part
+  only.
+- Missingness depends on slab coverage, so values are not missing at random across
+  protocols.
+
+**Changes:**
+- New `native_roi_missingness*.csv`: per ROI, overall and per protocol stratum, the number
+  of analysis-set subjects, the number with a value, the missing fraction and the median
+  `coverage_vs_t1`.
+- P9 prints complete-case counts per stratum.
+- The default is unchanged (decision D2).
+
+### CR-21 Main-model selection (correct; option added)
+
+- P9 and `make_support_masks.py` select `runnable=yes` only.
+- 232 of 711 runnable rows have `include_main_model` other than `yes`. These include 119
+  rows without `model_label`, plus MCI, other neurological and vascular groups.
+- `*_analysis.csv` carries `include_main_model`, but nothing stopped it from being used as
+  the main-model cohort.
+
+**Changes:**
+- New P9 `--main-model-only` option. Rows outside the main model are listed in
+  `*_excluded.csv`.
+- Without the option, P9 prints how many analysis-set subjects are outside the main model.
+- Extra support masks are harmless, because P9 selects the cohort, so
+  `make_support_masks.py` is unchanged.
+- Making the option the default changes N (decision D11).
+
+### CR-22 Registration on a downsampled T1 (claims correct; provenance bug fixed)
+
+**The comment is right on both counts:**
+- The final extraction stays on the native QSM grid.
+- Whole-brain Dice cannot show local ribbon misalignment.
+
+**Provenance bug found:** reuse checks ignored registration settings. A comparison run with
+`QSM_ROI_T1_SUBSAMP=0` (or another `QSM_ROI_SEARCH_MODE`) in the same native root would have
+silently reused the downsampled-T1 matrix and its label.
+
+**Changes:**
+- P8 compares the requested T1 resolution and search mode with those P1 recorded in its
+  rigid QC, and re-registers when they differ.
+- It records `p1_t1_resolution` and `p1_search_mode` in its QC, and the label is rebuilt
+  when they change.
+- The README describes the full-resolution comparison: a second native root, then
+  `compare_p9_runs.py`.
+- The default resolution is unchanged (decision D12).
+- `QSM_ROI_SEARCH_DEG` is not recorded by P1. After changing it, use `P8_FORCE_P1=1`.

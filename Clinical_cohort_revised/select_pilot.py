@@ -19,19 +19,17 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 
+from strata import SHORT_COVERAGE_MM, coverage_group, si_extent_mm, voxel_size_label
+
 HERE = Path(__file__).resolve().parent
 
 
 def geometry(path):
     """Header-only geometry summary of one image."""
     img = nib.load(path)
-    zooms = img.header.get_zooms()[:3]
     det = np.linalg.det(img.affine[:3, :3])
-    # Extent along the world axis closest to superior-inferior.
-    si_axis = int(np.argmax(np.abs(img.affine[2, :3])))
-    return {"neurological": bool(det > 0), "pixdim": "x".join(f"{z:.2g}" for z in zooms),
-            "first_dim_even": img.shape[0] % 2 == 0,
-            "si_extent_mm": float(img.shape[si_axis] * zooms[si_axis])}
+    return {"neurological": bool(det > 0), "pixdim": voxel_size_label(img.header.get_zooms()),
+            "first_dim_even": img.shape[0] % 2 == 0, "si_extent_mm": si_extent_mm(img)}
 
 
 def main():
@@ -39,7 +37,7 @@ def main():
     ap.add_argument("--worklist", type=Path, default=HERE / "worklist.csv")
     ap.add_argument("--out", type=Path, default=HERE / "pilot_ids.csv")
     ap.add_argument("--per-stratum", type=int, default=2)
-    ap.add_argument("--short-coverage-mm", type=float, default=125.0)
+    ap.add_argument("--short-coverage-mm", type=float, default=SHORT_COVERAGE_MM)
     args = ap.parse_args()
 
     wl = pd.read_csv(args.worklist, dtype=str).fillna("")
@@ -62,7 +60,7 @@ def main():
                      "t1_orientation": "neurological" if t1["neurological"] else "radiological",
                      "t1_pixdim": t1["pixdim"], "t1_first_dim": "even" if t1["first_dim_even"] else "odd",
                      "qsm_pixdim": q["pixdim"],
-                     "qsm_coverage": "short" if coverage < args.short_coverage_mm else "full",
+                     "qsm_coverage": coverage_group(coverage, args.short_coverage_mm),
                      "qsm_coverage_mm": round(float(coverage), 1)})
     geo = pd.DataFrame(rows)
     if geo.empty:
