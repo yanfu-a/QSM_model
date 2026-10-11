@@ -312,3 +312,42 @@ same option to `qc_exclusion_report.py`.
   between-subject variation.
 - (b) Register at full resolution (`QSM_ROI_T1_SUBSAMP=0`) for the whole cohort. This
   costs a slower rigid registration per subject.
+
+## D13. Subcortical and deep structures
+
+**Current behaviour (revision 7).** P9 extracts 14 structures (README, "Subcortical
+structures") into separate tables with the exact requested column names. Nothing existing
+changes: the cortical columns, `analysis_pass`, thresholds and the primary statistic are as
+before.
+
+**Choices made without a prior decision; please confirm:**
+1. **Statistic.** The table holds the run's primary statistic, the median, with no suffix in
+   the column names. The mean is written to a second table only with `--stat both`. This
+   follows D8 and does not settle it.
+2. **Gates.** The cortical gates are reused (20 voxels, 20 mm3, 50% of the structure's T1
+   volume). The smallest structures (accumbens, amygdala) have few QSM voxels, so the
+   voxel gate matters most there. No new threshold was introduced.
+3. **Separate table.** Subcortical values are not part of `*_analysis.csv` or the
+   completeness rule (D2). They can be missing for a scan that is in the analysis set.
+
+**Limitations to consider before using these values:**
+- **Partial volume:** no erosion is applied, as for the cortex. Small and thin structures
+  (accumbens, amygdala, pallidum, caudate head next to the ventricle) are dominated by
+  boundary voxels, and the labels are resampled from the T1 grid by nearest neighbour.
+  Neighbouring CSF, vessels or white matter can bias the value. Eroding a voxel would be a
+  methodological change; it was not made.
+- **Deep-structure contrast:** the pallidum and putamen are iron-rich, with a wide range of
+  values, so the median is more robust than the mean.
+- **Registration:** a small misregistration (D12) affects small structures more than the
+  cortex-wide statistics do.
+- **Coverage:** inferior structures can be cut off in short slabs, as the superior cortex
+  is. `native_subcortical_coverage.csv` gives `coverage_vs_t1` per structure; check how
+  often each structure is missing by protocol before pooling.
+- **SynthSeg quality:** the hippocampus and amygdala come from a 1 mm segmentation of
+  T1-weighted images; atrophy can reduce label accuracy. No manual check was done.
+
+**Options.**
+- (a) Keep as is.
+- (b) Report subcortical values after eroding each structure by one voxel (needs a decision
+  on structures too small to survive).
+- (c) Add `n_reportable_subcortical` thresholds to eligibility for models that need all 14.

@@ -1,8 +1,9 @@
 """Synthetic subjects with known ground truth for the regression tests.
 
 A subject is an ellipsoidal "brain" in world space with SynthSeg-like labels: cerebral
-white matter (2/41), lateral ventricles (4/43) and a 7 mm cortical shell split into the 34
-Desikan-Killiany parcels per hemisphere. It provides:
+white matter (2/41), lateral ventricles (4/43), the 14 subcortical structures (ellipsoids,
+mirrored across hemispheres) and a 7 mm cortical shell split into the 34 Desikan-Killiany
+parcels per hemisphere. It provides:
 
 * T1.nii and seg_T1.nii.gz on a configurable T1 grid (storage orientation, voxel size,
   dimensions, axis permutation);
@@ -22,6 +23,20 @@ import nibabel as nib
 FS_L = [1001, 1002, 1003] + list(range(1005, 1036))
 FS_R = [k + 1000 for k in FS_L]
 RADII = np.array([70.0, 85.0, 60.0])
+
+# Subcortical ellipsoids: (left label, right label, centre (|x|, y, z) and radii in units of
+# rx / 70 mm, mean QSM in ppb). Later entries overwrite earlier ones where they overlap and the
+# ventricles overwrite all of them (the caudate touches the ventricle).
+SUBCORTICAL = (
+    (10, 49, (12, -12, -6), (6, 8, 5), 40.0),        # thalamus
+    (11, 50, (22, 12, 6), (4, 8, 5), 25.0),          # caudate
+    (12, 51, (29, 4, -4), (4, 10, 7), 35.0),         # putamen
+    (13, 52, (21, 0, -6), (3, 5, 4), 60.0),          # pallidum
+    (17, 53, (26, -35, -20), (5, 13, 4), 15.0),      # hippocampus
+    (18, 54, (24, 12, -26), (4, 4, 4), 20.0),        # amygdala
+    (26, 58, (10, 24, -12), (3.5, 3.5, 3.5), 30.0),  # accumbens
+)
+SUBCORTICAL_LABELS = tuple(k for entry in SUBCORTICAL for k in entry[:2])
 
 
 def _rotation(deg_xyz):
@@ -46,6 +61,10 @@ def tissue(w, radii):
     brain = re <= 1
     lab[brain] = np.where(x[brain] < 0, 2, 41)
     s = rx / 70.0
+    for left, right, (cx, cy, cz), (ax, ay, az_), _ in SUBCORTICAL:
+        inside = ((np.abs(x) - cx * s) / (ax * s)) ** 2 + ((y - cy * s) / (ay * s)) ** 2 \
+            + ((z - cz * s) / (az_ * s)) ** 2 <= 1
+        lab[inside & brain] = np.where(x[inside & brain] < 0, left, right)
     vent = ((np.abs(x) - 12 * s) / (6 * s)) ** 2 + (y / (20 * s)) ** 2 + ((z - 10 * s) / (8 * s)) ** 2 <= 1
     lab[vent & brain] = np.where(x[vent & brain] < 0, 4, 43)
     ctx = brain & (depth < 7)
@@ -121,6 +140,9 @@ def make_subject(out, *, seed=0, t1_axes="+x,+y,+z", t1_zooms=(1.0, 1.0, 1.0), t
         q[ctx] = 10 + idx[ctx] * 0.5 + rng.normal(0, 4, ctx.sum())
         wm = np.isin(lab, (2, 41)) & inside
         q[wm] = -20 + rng.normal(0, 4, wm.sum())
+        for left, right, _, _, mean in SUBCORTICAL:
+            nuc = np.isin(lab, (left, right)) & inside
+            q[nuc] = mean + 2.0 * (lab[nuc] == right) + rng.normal(0, 4, nuc.sum())
         ve = np.isin(lab, (4, 43)) & inside
         q[ve] = 0.0 if qsm_zero_csf else 3 + rng.normal(0, 2, ve.sum())
         v = np.linalg.inv(at) @ np.vstack([w, np.ones(w.shape[1])])

@@ -40,16 +40,16 @@ QSM_TEST_REAL_FSL=1 python -m pytest Clinical_cohort_revised/tests -v           
 | Suite | Tests | Passed | Skipped | Failed |
 |---|---|---|---|---|
 | `test_native_grid.py` (FLIRT conventions) | 9 | 9 | 0 | 0 |
-| `test_p9_unit.py` (extraction, gates, parsing, zero counts, quantization, strata) | 29 | 29 | 0 | 0 |
+| `test_p9_unit.py` (extraction, gates, parsing, zero counts, quantization, strata, subcortical map) | 32 | 32 | 0 | 0 |
 | `test_support_masks.py` | 6 | 6 | 0 | 0 |
 | `test_p8.py` (P8 end to end, stubs) | 25 | 25 | 0 | 0 |
 | `test_geometry.py` (7 geometries, revised vs original P8) | 15 | 15 | 0 | 0 |
-| `test_p9_integration.py` (24-subject synthetic cohort) | 11 | 11 | 0 | 0 |
+| `test_p9_integration.py` (24-subject synthetic cohort) | 13 | 13 | 0 | 0 |
 | `test_reports.py` (QC exclusion report, run comparison) | 4 | 4 | 0 | 0 |
 | `test_fsl_real.py` (needs FSL) | 6 | 0 | 6 | 0 |
-| **Total** | **105** | **99** | **6** | **0** |
+| **Total** | **110** | **104** | **6** | **0** |
 
-The full run took 246 s (revision 6). Static checks:
+The full run took 244 s (revision 7). Static checks:
 - `bash -n` on P8: clean.
 - `shellcheck -S warning`: one pre-existing, intentional SC2163 (exporting variables by
   name).
@@ -90,6 +90,7 @@ The full run took 246 s (revision 6). Static checks:
 | Registration settings provenance (CR-22) | `test_p8::test_registration_settings_are_recorded_and_enforced`, `test_legacy_p1_qc_without_settings_is_re_registered`, invalidation case "registration settings" | A changed T1 resolution or search mode re-registers and rebuilds; unchanged settings skip; unrecorded settings re-register | As expected |
 | Missing T1 cortex volume is not a pass (revision 6, CR-23) | `test_reports::test_exclusions_are_counted_per_rule_and_stratum` (GRIDNOT1, NOVOL, P1STOP) | Counted as not measured or not evaluated; "alone" only when every other applied rule passed | As expected. Before the fix, `of_which_pass_t1_rule` counted the unmeasured scan (2 instead of 1) |
 | Volume table part of segmentation provenance (CR-24) | `test_p8::test_segmentation_reuse_requires_its_volume_table[delete, edit]`, `test_missing_volume_measures_fail_or_stop` | Deleted or edited table: label not reused, SynthSeg rerun, ICV restored; no table: exit 13; no ICV column: ICV rule fails | As expected. Before the fix, the deleted table led to reuse and a QC pass with `synthseg_icv_ml=nan` |
+| Subcortical extraction (revision 7, D13) | `test_p9_unit` (label/column map, LUT and model-list checks, gates, status unchanged); `test_p9_integration::test_subcortical_tables...`, `..._leaves_cortical_outputs...` | Exact 14 column names and order; values and gates match an independent calculation from the files; cortical tables, 68 ROIs and `analysis_pass` unchanged | As expected (on synthetic structures; real SynthSeg labels untested here) |
 | Paired run comparison (CR-19, CR-22) | `test_reports::test_compare_p9_runs` | Hand-computed differences, r, gained/lost values, strata | As expected |
 
 ## 4. Bugs reproduced on the audited code (915e78b) and resolved

@@ -238,3 +238,79 @@ def test_concordance_and_test_retest_run(capsys):
     assert p9.test_retest(df, names, "t") is not None
     out = capsys.readouterr().out
     assert "not test-retest reliability" in out and "Test-retest" in out
+
+
+SUBCORTICAL_COLUMNS = [
+    "L_Accumbens-area", "R_Accumbens-area", "L_Amygdala", "R_Amygdala", "L_Caudate", "R_Caudate",
+    "L_Hippocampus", "R_Hippocampus", "L_Pallidum", "R_Pallidum", "L_Putamen", "R_Putamen",
+    "L_Thalamus", "R_Thalamus",
+]
+
+
+def test_subcortical_map_has_the_exact_columns_and_labels(fs_fixtures):
+    fs_to_name, rows = p9.build_subcortical_map(fs_fixtures)
+    assert list(fs_to_name.values()) == SUBCORTICAL_COLUMNS
+    assert dict(zip(SUBCORTICAL_COLUMNS, fs_to_name)) == {
+        "L_Accumbens-area": 26, "R_Accumbens-area": 58, "L_Amygdala": 18, "R_Amygdala": 54,
+        "L_Caudate": 11, "R_Caudate": 50, "L_Hippocampus": 17, "R_Hippocampus": 53,
+        "L_Pallidum": 13, "R_Pallidum": 52, "L_Putamen": 12, "R_Putamen": 51,
+        "L_Thalamus": 10, "R_Thalamus": 49}
+    assert [r["column"] for r in rows] == SUBCORTICAL_COLUMNS
+
+
+def _fs_copy(fs_fixtures, tmp_path, lut_edit=None, drop_label=None):
+    import shutil
+    root = tmp_path / "fs"
+    shutil.copytree(fs_fixtures, root)
+    if lut_edit:
+        lut = root / "FreeSurferColorLUT.txt"
+        lut.write_text(lut.read_text().replace(*lut_edit))
+    if drop_label is not None:
+        model = root / "models" / "synthseg_parcellation_labels.npy"
+        labels = np.load(model)
+        np.save(model, labels[labels != drop_label])
+    return root
+
+
+def test_subcortical_map_accepts_old_thalamus_name_and_rejects_changes(fs_fixtures, tmp_path):
+    old = _fs_copy(fs_fixtures, tmp_path / "a", ("Left-Thalamus ", "Left-Thalamus-Proper "))
+    assert "L_Thalamus" in p9.build_subcortical_map(old)[0].values()
+    renamed = _fs_copy(fs_fixtures, tmp_path / "b", ("Left-Hippocampus", "Left-Hippocampus-Other"))
+    with pytest.raises(SystemExit, match="Label IDs or names have changed"):
+        p9.build_subcortical_map(renamed)
+    dropped = _fs_copy(fs_fixtures, tmp_path / "c", drop_label=26)
+    with pytest.raises(SystemExit, match="SynthSeg model has no label 26"):
+        p9.build_subcortical_map(dropped)
+
+
+def test_subcortical_rois_use_the_same_gates_and_never_change_the_status(tmp_path):
+    sub_keys = [10, 49, 11]                       # thalamus L/R, caudate L
+    lab = np.zeros((20, 20, 20), np.int16)
+    lab[:, :, :3] = 1001                          # a cortical ROI so the subject is extractable
+    lab[2:5, 2:5, 5:8] = 10                       # 27 voxels, value 7
+    lab[8:10, 2:5, 5:8] = 49                      # 18 voxels: below --min-voxels 20
+    nib.save(nib.Nifti1Image(lab, np.eye(4)), tmp_path / "l.nii.gz")
+    q = np.zeros(lab.shape, np.float32)
+    q[lab == 1001] = 5.0
+    q[lab == 10] = 7.0
+    q[lab == 49] = 9.0
+    nib.save(nib.Nifti1Image(q, np.eye(4)), tmp_path / "q.nii.gz")
+    seg = np.zeros(lab.shape, np.int16)
+    seg[lab == 1001], seg[lab == 10], seg[lab == 49] = 1001, 10, 49
+    nib.save(nib.Nifti1Image(seg, np.eye(4)), tmp_path / "s.nii.gz")
+    (tmp_path / "t1.nii").write_bytes(b"t1")
+    task = {"label": tmp_path / "l.nii.gz", "qsm": tmp_path / "q.nii.gz", "t1": tmp_path / "t1.nii",
+            "support": None, "t1seg": tmp_path / "s.nii.gz"}
+    opts = {"min_voxels": 20, "min_mm3": 20.0, "min_coverage": 0.5, "csf_ref": False,
+            "min_csf_voxels": 30, "sub_keys": sub_keys}
+    r = p9.process_subject(task, [1001], opts)
+    sub = r["sub"]
+    assert r["status"] == "OK" and r["n_reportable"] == 1
+    assert sub["medians"][0] == 7.0 and sub["means"][0] == 7.0 and sub["counts"][0] == 27
+    assert np.isnan(sub["medians"][1]) and sub["counts"][1] == 18           # below the voxel gate
+    assert np.isnan(sub["medians"][2]) and sub["label_counts"][2] == 0      # absent from the label
+    assert list(sub["t1_mm3"]) == [27.0, 18.0, 0.0]
+    assert np.allclose(sub["coverage"][:2], 1.0) and np.isnan(sub["coverage"][2])
+    without = p9.process_subject(task, [1001], {**opts, "sub_keys": []})
+    assert "sub" not in without and without["n_reportable"] == r["n_reportable"]
+    assert np.array_equal(without["medians"], r["medians"], equal_nan=True)

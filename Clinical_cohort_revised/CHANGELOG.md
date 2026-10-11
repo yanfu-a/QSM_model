@@ -8,7 +8,22 @@ Each change is marked for whether it can affect:
 
 "yes" means the change can alter that quantity for some subjects; "no" means it cannot.
 
-## Revision 6 (this revision): missing measurements are never passes (CODE_REVIEW CR-23, CR-24)
+## Revision 7 (this revision): subcortical and deep structures
+
+Adds extraction of 14 subcortical structures. Cortical outputs, thresholds, eligibility and
+the primary statistic are unchanged; with identical inputs, the existing tables are
+identical to those of revision 6.
+
+| Change | Values | ROIs | QC | N |
+|---|---|---|---|---|
+| P9: `HUASHAN_NATIVE_SUBCORTICAL.csv`, `*_analysis.csv` (and `*_mean.csv` with `--stat both`) with columns `L_/R_` Accumbens-area, Amygdala, Caudate, Hippocampus, Pallidum, Putamen, Thalamus, named exactly, using the cortical gates | no | no (14 new, separate) | no | no |
+| P9: `native_subcortical_coverage.csv`, `native_subcortical_label_mapping.csv`, `n_reportable_subcortical` in the QC table, `subcortical_rois` in the run info | no | no | no | no |
+| P9: label IDs and names of the 14 structures checked against the FreeSurfer LUT and the SynthSeg model's label list; a mismatch stops the run | no | no | no | no |
+| Tests: synthetic subjects now contain the 14 structures; LUT and label-list fixtures extended | no | no | no | no |
+
+No change to P8 is needed: its label already contains these structures. Decision D13.
+
+## Revision 6 (`d419f73`): missing measurements are never passes (CODE_REVIEW CR-23, CR-24)
 
 | Change | Values | ROIs | QC | N |
 |---|---|---|---|---|

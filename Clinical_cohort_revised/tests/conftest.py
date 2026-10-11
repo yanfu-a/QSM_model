@@ -167,13 +167,20 @@ def fs_fixtures(tmp_path_factory):
     root = tmp_path_factory.mktemp("fs")
     (root / "models").mkdir()
     lines = ["#No. Label Name: R G B A", "0 Unknown 0 0 0 0", "2 Left-Cerebral-White-Matter 245 245 245 0"]
+    for fs, nm in ((10, "Left-Thalamus"), (11, "Left-Caudate"), (12, "Left-Putamen"), (13, "Left-Pallidum"),
+                   (17, "Left-Hippocampus"), (18, "Left-Amygdala"), (26, "Left-Accumbens-area"),
+                   (49, "Right-Thalamus"), (50, "Right-Caudate"), (51, "Right-Putamen"),
+                   (52, "Right-Pallidum"), (53, "Right-Hippocampus"), (54, "Right-Amygdala"),
+                   (58, "Right-Accumbens-area")):
+        lines.append(f"{fs} {nm} 0 118 14 0")
     for base, hemi in ((1000, "lh"), (2000, "rh")):
         lines.append(f"{base} ctx-{hemi}-unknown 25 5 25 0")
         lines += [f"{base + i} ctx-{hemi}-{n} 25 100 40 0" for i, n in enumerate(NAMES, 1)]
     (root / "FreeSurferColorLUT.txt").write_text("\n".join(lines) + "\n")
     fs_l = [1001, 1002, 1003] + list(range(1005, 1036))
     np.save(root / "models" / "synthseg_parcellation_labels.npy",
-            np.array([0, 2, 3, 4, 41, 42, 43] + fs_l + [k + 1000 for k in fs_l]))
+            np.array([0, 2, 3, 4, 41, 42, 43, 10, 11, 12, 13, 17, 18, 26, 49, 50, 51, 52, 53, 54, 58]
+                     + fs_l + [k + 1000 for k in fs_l]))
 
     def csv_rows(order):
         rows = ["index,name", "1,L_white_matter"] + [f"{i + 1},L_{n}" for i, n in enumerate(order, 1)]

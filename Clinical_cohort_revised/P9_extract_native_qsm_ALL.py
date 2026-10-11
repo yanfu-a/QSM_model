@@ -113,6 +113,21 @@ FS_R = [k + 1000 for k in FS_L]
 
 INSULA_L, INSULA_R = 1035, 2035
 
+# Subcortical and deep structures: SynthSeg aseg labels, already in the native label that P8
+# resamples from the T1 segmentation. Output columns are named exactly as below, in this order
+# (left then right for each structure). (structure, left label, right label, accepted
+# FreeSurfer LUT names without the Left-/Right- prefix; FreeSurfer 7+ names the thalamus
+# "Thalamus", older versions "Thalamus-Proper").
+SUBCORTICAL_STRUCTURES = (
+    ("Accumbens-area", 26, 58, ("Accumbens-area",)),
+    ("Amygdala", 18, 54, ("Amygdala",)),
+    ("Caudate", 11, 50, ("Caudate",)),
+    ("Hippocampus", 17, 53, ("Hippocampus",)),
+    ("Pallidum", 13, 52, ("Pallidum",)),
+    ("Putamen", 12, 51, ("Putamen",)),
+    ("Thalamus", 10, 49, ("Thalamus", "Thalamus-Proper")),
+)
+
 
 def read_labels(path):
     """Read Desikan_labels.csv into {label ID: name}, using the same parser as P5."""
@@ -282,6 +297,41 @@ def build_label_map(csv_labels, labels_path, fs_home, allow_name_mismatch=False)
                              "--allow-label-name-mismatch only after checking the table above).")
         print(f"WARNING: {msg}; continuing because --allow-label-name-mismatch was given.")
     rows.sort(key=lambda r: r["fs_label"])
+    return fs_to_name, rows
+
+
+def build_subcortical_map(fs_home):
+    """({FreeSurfer label: output column name} in column order, mapping rows) for the 14
+    subcortical structures.
+
+    Each label is checked against FreeSurferColorLUT.txt (by name) and against the label list
+    of the SynthSeg model, so an update that renumbers or drops a structure stops the run
+    instead of mislabelling a column.
+    """
+    lut = {}
+    with open(fs_home / "FreeSurferColorLUT.txt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                lut[int(parts[0])] = parts[1]
+    model_path = fs_home / "models" / "synthseg_parcellation_labels.npy"
+    model = {int(x) for x in np.load(model_path)} if model_path.exists() else None
+    if model is None:
+        print(f"WARNING: {model_path} not found; SynthSeg label list not checked for subcortical labels")
+    fs_to_name, rows = {}, []
+    for structure, left, right, accepted in SUBCORTICAL_STRUCTURES:
+        for side, prefix, fs in (("L", "Left", left), ("R", "Right", right)):
+            expected = [f"{prefix}-{a}" for a in accepted]
+            if lut.get(fs) not in expected:
+                raise SystemExit(f"FreeSurfer LUT label {fs} is '{lut.get(fs)}'; expected one of {expected}. "
+                                 "Label IDs or names have changed; stopping.")
+            if model is not None and fs not in model:
+                raise SystemExit(f"SynthSeg model has no label {fs} ({lut[fs]}); was FreeSurfer updated?")
+            column = f"{side}_{structure}"
+            fs_to_name[fs] = column
+            rows.append({"fs_label": fs, "fs_name": lut[fs], "column": column})
+    if len(set(fs_to_name.values())) != len(fs_to_name):
+        raise SystemExit("Subcortical output column names are not unique")
     return fs_to_name, rows
 
 
@@ -483,10 +533,19 @@ def process_subject(task, keys, opts):
     try:
         lab, qsm, valid, zooms, vox_mm3 = load_native_grid(task["label"], task["qsm"],
                                                            task["support"])
-        t1_mm3 = (t1_roi_volumes(task["t1seg"], keys) if task["t1seg"] is not None
-                  else np.full(len(keys), np.nan))
+        sub_keys = list(opts.get("sub_keys", ()))
+        all_keys = list(keys) + sub_keys
+        t1_all = (t1_roi_volumes(task["t1seg"], all_keys) if task["t1seg"] is not None
+                  else np.full(len(all_keys), np.nan))
+        t1_mm3, t1_sub = t1_all[:len(keys)], t1_all[len(keys):]
         res = extract_one(lab, qsm, valid, keys, vox_mm3, t1_mm3, opts["min_voxels"],
                           opts["min_mm3"], opts["min_coverage"])
+        if sub_keys:
+            # Same gates as the cortical ROIs. Reported separately: they never change the
+            # extraction status, so they cannot change analysis_pass.
+            res["sub"] = extract_one(lab, qsm, valid, sub_keys, vox_mm3, t1_sub, opts["min_voxels"],
+                                     opts["min_mm3"], opts["min_coverage"])
+            res["sub"]["t1_mm3"] = t1_sub
         qsm_img = nib.load(str(task["qsm"]))
         hdr = qsm_img.header
         nonzero = np.isfinite(qsm) & (qsm != 0)
@@ -655,6 +714,9 @@ def main():
     def out_path(tail):
         return args.out_dir / f"HUASHAN_NATIVE_DK{sfx}{tail}"
 
+    def sub_path(tail):
+        return args.out_dir / f"HUASHAN_NATIVE_SUBCORTICAL{sfx}{tail}"
+
     csv_labels = read_labels(args.labels)
     fs_to_name, mapping_rows = build_label_map(csv_labels, args.labels, args.freesurfer_home,
                                                args.allow_label_name_mismatch)
@@ -665,6 +727,13 @@ def main():
     print(f"Cortical label mapping OK: {len(keys)} regions (34 per hemisphere, including insula; "
           f"{INSULA_L}/{INSULA_R} in {args.labels.name} has no corresponding CSV entry and is added in this branch); "
           f"names checked against the FreeSurfer LUT ({mapping_path.name})")
+
+    sub_fs_to_name, sub_mapping_rows = build_subcortical_map(args.freesurfer_home)
+    sub_keys = list(sub_fs_to_name)                  # column order, not label order
+    sub_names = [sub_fs_to_name[k] for k in sub_keys]
+    sub_mapping_path = args.out_dir / f"native_subcortical_label_mapping{sfx}.csv"
+    write_csv(pd.DataFrame(sub_mapping_rows), sub_mapping_path)
+    print(f"Subcortical label mapping OK: {len(sub_keys)} structures ({sub_mapping_path.name})")
 
     wl = pd.read_csv(args.worklist, dtype=str).fillna("")
     # Worklist input headers must be English; no legacy-language aliases are used.
@@ -807,6 +876,7 @@ def main():
                        "freesurfer_lut": described(args.freesurfer_home / "FreeSurferColorLUT.txt"),
                        "failed_list": described(args.failed_list)},
             "grid_conversion_tag": GRID_CONVERSION_TAG,
+            "subcortical_rois": dict(zip(sub_names, sub_keys)),
             "versions": {"python": platform.python_version(), "numpy": np.__version__,
                          "nibabel": nib.__version__, "pandas": pd.__version__},
             "counts": counts,
@@ -822,7 +892,7 @@ def main():
 
     opts = {"min_voxels": args.min_voxels, "min_mm3": args.min_mm3,
             "min_coverage": args.min_coverage, "csf_ref": args.csf_ref,
-            "min_csf_voxels": args.min_csf_voxels}
+            "min_csf_voxels": args.min_csf_voxels, "sub_keys": sub_keys}
     print(f"Extracting with {args.jobs} threads...")
     with ThreadPoolExecutor(args.jobs) as ex:
         results = list(ex.map(lambda t: process_subject(t, keys, opts), tasks))
@@ -837,6 +907,15 @@ def main():
     coverage = np.full((n_sub, n_keys), np.nan)
     t1_mm3 = np.full((n_sub, n_keys), np.nan)
     vox_mm3 = np.full(n_sub, np.nan)
+    n_sub_keys = len(sub_keys)
+    sub_label_counts = np.zeros((n_sub, n_sub_keys), dtype=np.int64)
+    sub_counts = np.zeros((n_sub, n_sub_keys), dtype=np.int64)
+    sub_zero = np.zeros((n_sub, n_sub_keys), dtype=np.int64)
+    sub_unsupported_zero = np.zeros((n_sub, n_sub_keys), dtype=np.int64)
+    sub_means = np.full((n_sub, n_sub_keys), np.nan)
+    sub_medians = np.full((n_sub, n_sub_keys), np.nan)
+    sub_coverage = np.full((n_sub, n_sub_keys), np.nan)
+    sub_t1_mm3 = np.full((n_sub, n_sub_keys), np.nan)
     status = [r["status"] for r in results]
     for i, r in enumerate(results):
         if "counts" not in r:
@@ -845,6 +924,12 @@ def main():
         zero_counts[i], unsupported_zero[i] = r["zero_counts"], r["unsupported_zero_counts"]
         means[i], medians[i] = r["means"], r["medians"]
         coverage[i], t1_mm3[i], vox_mm3[i] = r["coverage"], r["t1_mm3"], r["vox_mm3"]
+        if "sub" in r:
+            sr = r["sub"]
+            sub_label_counts[i], sub_counts[i] = sr["label_counts"], sr["counts"]
+            sub_zero[i], sub_unsupported_zero[i] = sr["zero_counts"], sr["unsupported_zero_counts"]
+            sub_means[i], sub_medians[i] = sr["means"], sr["medians"]
+            sub_coverage[i], sub_t1_mm3[i] = sr["coverage"], sr["t1_mm3"]
 
     # Median/mean columns stay adjacent for each ROI.
     stats = {"both": ("med", "mean"), "median": ("med",), "mean": ("mean",)}[args.stat]
@@ -866,6 +951,18 @@ def main():
 
     csv_path = out_path(".csv")
     write_csv(out, csv_path)
+
+    # Subcortical table: the 14 columns carry the exact structure names (no _med/_mean suffix).
+    # They hold the primary statistic; with --stat both, the other statistic goes to *_mean.csv.
+    sub_stat_values = {"med": sub_medians, "mean": sub_means}
+    sub_tables = {"": pd.concat([meta_out, pd.DataFrame(
+        {nm: sub_stat_values[primary][:, j] for j, nm in enumerate(sub_names)})], axis=1)}
+    if len(stats) > 1:
+        other = stats[1]
+        sub_tables["_" + other] = pd.concat([meta_out, pd.DataFrame(
+            {nm: sub_stat_values[other][:, j] for j, nm in enumerate(sub_names)})], axis=1)
+    for tail, table in sub_tables.items():
+        write_csv(table, sub_path(f"{tail}.csv"))
 
     csf_values = np.array([r.get("csf_ref", np.nan) for r in results], dtype=float)
     csf_counts = np.array([r.get("csf_voxels", 0) for r in results], dtype=np.int64)
@@ -952,6 +1049,8 @@ def main():
 
     analysis_path = out_path("_analysis.csv")
     write_csv(out.loc[analysis_pass], analysis_path)
+    for tail, table in sub_tables.items():
+        write_csv(table.loc[analysis_pass], sub_path(f"{tail}_analysis.csv"))
 
     if args.csf_ref:
         ref_roi = roi_out.subtract(csf_values, axis=0)
@@ -1046,6 +1145,7 @@ def main():
         "cortex_valid_zero_fraction": np.round(cortex_zero_frac, 5),
         "cortex_unsupported_zero_voxels": unsupported_zero.sum(axis=1),
         "n_reportable_rois": n_reportable,
+        "n_reportable_subcortical": np.isfinite(sub_medians).sum(axis=1),
         "n_nan_DK": out[[f"{n}_{primary}" for n in names]].isna().sum(axis=1).to_numpy(),
         "n_low_voxels": [r.get("n_low_voxels", n_keys) for r in results],
         "n_low_coverage": [r.get("n_low_coverage", 0) for r in results],
@@ -1083,6 +1183,26 @@ def main():
         "coverage_vs_t1": coverage.ravel().round(4),
         "roi_value_reported": np.isfinite(reported).ravel(),
     }), args.out_dir / f"native_roi_coverage{sfx}.csv")
+
+    sub_qsm_label_mm3 = sub_label_counts * vox_mm3[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sub_fov_fraction = sub_qsm_label_mm3 / sub_t1_mm3
+    sub_reported = sub_stat_values[primary]
+    write_csv(pd.DataFrame({
+        "IID": np.repeat(ids, n_sub_keys),
+        "ROI": np.tile(sub_names, n_sub),
+        "fs_label": np.tile(sub_keys, n_sub),
+        "atlas_label_voxels": sub_label_counts.ravel(),
+        "valid_qsm_voxels": sub_counts.ravel(),
+        "valid_zero_voxels": sub_zero.ravel(),
+        "unsupported_zero_voxels": sub_unsupported_zero.ravel(),
+        "t1_label_mm3": sub_t1_mm3.ravel().round(1),
+        "qsm_grid_label_mm3": sub_qsm_label_mm3.ravel().round(1),
+        "valid_qsm_mm3": (sub_counts * vox_mm3[:, None]).ravel().round(1),
+        "fov_fraction": sub_fov_fraction.ravel().round(4),
+        "coverage_vs_t1": sub_coverage.ravel().round(4),
+        "roi_value_reported": np.isfinite(sub_reported).ravel(),
+    }), args.out_dir / f"native_subcortical_coverage{sfx}.csv")
 
     # ROI missingness in the analysis set, overall and by protocol stratum. Missing values
     # depend on slab coverage, so they are not missing at random across protocols (D2).
@@ -1139,6 +1259,12 @@ def main():
         print(f"Analysis-set subjects with all {n_keys} ROI values: {int(complete.sum())}/{int(analysis_pass.sum())} ("
               + "; ".join(f"{k}: {full.get(k, 0)}/{v}" for k, v in sorted(by_stratum.items()))
               + f"); missingness by ROI and stratum in native_roi_missingness{sfx}.csv")
+    if analysis_pass.any():
+        got = np.isfinite(sub_stat_values[primary][analysis_pass]).sum(axis=0)
+        n_pass = int(analysis_pass.sum())
+        short = [f"{nm} {int(k)}/{n_pass}" for nm, k in zip(sub_names, got) if k < n_pass]
+        print(f"Subcortical values in the analysis set ({n_sub_keys} structures): "
+              + ("with missing values: " + ", ".join(short) if short else f"all reported for all {n_pass} subjects"))
     if not args.main_model_only and "include_main_model" in meta_out.columns:
         outside = analysis_pass & meta_out["include_main_model"].str.strip().str.lower().ne("yes").to_numpy()
         if outside.any():

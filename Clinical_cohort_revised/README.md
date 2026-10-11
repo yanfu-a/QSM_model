@@ -178,6 +178,9 @@ $PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-d
 - `native_roi_missingness.csv` (analysis set, per ROI and protocol stratum);
 - `native_label_mapping.csv`;
 - `native_mask_voxel_counts.csv`;
+- subcortical and deep structures (see "Subcortical structures" below):
+  `HUASHAN_NATIVE_SUBCORTICAL.csv`, `HUASHAN_NATIVE_SUBCORTICAL_analysis.csv`,
+  `native_subcortical_coverage.csv` and `native_subcortical_label_mapping.csv`;
 - with `--csf-ref`: `*_csfref.csv` and `*_csfref_analysis.csv`.
 
 **First full run.**
@@ -189,6 +192,42 @@ $PY P9_extract_native_qsm_ALL.py --worklist $WL --native-dir $NATIVE --support-d
 
 Peak P9 memory is roughly `--jobs` x 0.4 GB, because each subject's T1-space segmentation is
 read for coverage.
+
+## Subcortical structures
+
+P9 also extracts 14 subcortical and deep structures from the same native label, with no
+change to P8, the 68 cortical columns, `analysis_pass` or any threshold. The labels are
+SynthSeg's, resampled with the cortex, so existing P8 outputs already contain them.
+
+| Left column | Right column | Structure | SynthSeg labels (L / R) |
+|---|---|---|---|
+| `L_Accumbens-area` | `R_Accumbens-area` | Nucleus accumbens | 26 / 58 |
+| `L_Amygdala` | `R_Amygdala` | Amygdala | 18 / 54 |
+| `L_Caudate` | `R_Caudate` | Caudate nucleus | 11 / 50 |
+| `L_Hippocampus` | `R_Hippocampus` | Hippocampus | 17 / 53 |
+| `L_Pallidum` | `R_Pallidum` | Globus pallidus | 13 / 52 |
+| `L_Putamen` | `R_Putamen` | Putamen | 12 / 51 |
+| `L_Thalamus` | `R_Thalamus` | Thalamus | 10 / 49 |
+
+- **`HUASHAN_NATIVE_SUBCORTICAL.csv`:** all extracted subjects, with the same metadata
+  columns as the cortical table and then the 14 columns above, named exactly as listed (no
+  `_med` or `_mean` suffix), left then right for each structure.
+  - **Statistic:** the primary statistic of the run, the median by default. With
+    `--stat both`, the mean goes to `HUASHAN_NATIVE_SUBCORTICAL_mean.csv`.
+  - **Analysis set:** `*_analysis.csv` holds the rows with `analysis_pass`, the same
+    subjects as the cortical analysis file.
+- **Gates:** the same as the cortical ROIs (`--min-voxels`, `--min-mm3`, `--min-coverage`),
+  against the structure's T1-space volume. A value that fails a gate is empty. The
+  subcortical values do not count toward `--min-reportable-rois` or `analysis_pass`; the
+  QC table gives `n_reportable_subcortical` (of 14).
+- **Audit:** `native_subcortical_coverage.csv` (voxels, zero-valued voxels, `coverage_vs_t1`
+  and `roi_value_reported` per subject and structure) and
+  `native_subcortical_label_mapping.csv`.
+- **Label check:** each label's name is checked against `FreeSurferColorLUT.txt` and the
+  SynthSeg model's label list at run time (the thalamus may be named `Thalamus` or
+  `Thalamus-Proper`). A mismatch stops the run.
+- **Short slabs:** inferior structures (amygdala, hippocampus) are the most likely to lose
+  coverage. Check `native_subcortical_coverage.csv` by protocol stratum (D13).
 
 ## Sensitivity analyses
 

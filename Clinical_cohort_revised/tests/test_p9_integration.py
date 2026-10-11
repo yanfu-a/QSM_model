@@ -322,3 +322,66 @@ def test_run_with_no_extractable_subject_still_records_why(cohort, fs_fixtures, 
     assert code != 0 and "No eligible subjects" in log
     assert len(pd.read_csv(out / "HUASHAN_NATIVE_DK_excluded.csv")) == 2
     assert (out / "HUASHAN_NATIVE_DK_run_info.json").is_file()
+
+
+SUBCORTICAL_COLUMNS = [
+    "L_Accumbens-area", "R_Accumbens-area", "L_Amygdala", "R_Amygdala", "L_Caudate", "R_Caudate",
+    "L_Hippocampus", "R_Hippocampus", "L_Pallidum", "R_Pallidum", "L_Putamen", "R_Putamen",
+    "L_Thalamus", "R_Thalamus",
+]
+
+
+def test_subcortical_tables_have_exact_columns_and_correct_values(formal, cohort):
+    out, log = formal
+    sub = pd.read_csv(out / "HUASHAN_NATIVE_SUBCORTICAL.csv", dtype={"IID": str})
+    dk = pd.read_csv(out / "HUASHAN_NATIVE_DK.csv", dtype={"IID": str})
+    meta = [c for c in dk.columns if not (c.endswith("_med") or c.endswith("_mean")) and c != "IID"]
+    assert list(sub.columns) == ["IID"] + meta + SUBCORTICAL_COLUMNS          # exact names, no suffix
+    assert list(sub["IID"]) == list(dk["IID"])
+    qc = pd.read_csv(out / "HUASHAN_NATIVE_DK_qc.csv", dtype={"IID": str}).set_index("IID")
+    analysis = pd.read_csv(out / "HUASHAN_NATIVE_SUBCORTICAL_analysis.csv", dtype={"IID": str})
+    assert set(analysis["IID"]) == set(qc.index[qc["analysis_pass"].astype(str) == "True"])
+    assert list(analysis.columns) == list(sub.columns)
+
+    # values for OK1, recomputed from the image files with the pipeline's gates
+    native, s = cohort["native"], cohort["subject"]
+    lab = np.asanyarray(nib.load(native / "label" / "OK1_aparc_aseg_QSMnative.nii.gz").dataobj).astype(int)
+    qimg = nib.load(s["qsm"])
+    q = np.asanyarray(qimg.dataobj).astype(np.float64)
+    sup = np.asanyarray(nib.load(cohort["support"] / "OK1_support.nii.gz").dataobj) > 0
+    seg_img = nib.load(native / "t1seg" / "OK1_aparc+aseg_T1.nii.gz")
+    seg = np.asanyarray(seg_img.dataobj).astype(int)
+    vox_q, vox_t = abs(np.linalg.det(qimg.affine[:3, :3])), abs(np.linalg.det(seg_img.affine[:3, :3]))
+    mapping = pd.read_csv(out / "native_subcortical_label_mapping.csv")
+    assert list(mapping["column"]) == SUBCORTICAL_COLUMNS and list(mapping["fs_label"]) == [
+        26, 58, 18, 54, 11, 50, 17, 53, 13, 52, 12, 51, 10, 49]
+    row = sub.set_index("IID").loc["OK1"]
+    mean_row = pd.read_csv(out / "HUASHAN_NATIVE_SUBCORTICAL_mean.csv").set_index("IID").loc["OK1"]
+    cov = pd.read_csv(out / "native_subcortical_coverage.csv")
+    cov = cov[cov["IID"] == "OK1"].set_index("ROI")
+    reported = 0
+    for fs_label, name in zip(mapping["fs_label"], mapping["column"]):
+        m = (lab == fs_label) & sup & np.isfinite(q)
+        n, t1 = int(m.sum()), (seg == fs_label).sum() * vox_t
+        assert cov.loc[name, "valid_qsm_voxels"] == n and cov.loc[name, "fs_label"] == fs_label
+        if n >= 20 and n * vox_q >= 20 and t1 > 0 and n * vox_q / t1 >= 0.5:
+            assert np.isclose(row[name], np.median(q[m]), atol=1e-5), name
+            assert np.isclose(mean_row[name], q[m].mean(), atol=1e-6), name
+            assert bool(cov.loc[name, "roi_value_reported"])
+            reported += 1
+        else:
+            assert np.isnan(row[name]) and not bool(cov.loc[name, "roi_value_reported"])
+    assert reported == 14
+    assert qc.loc["OK1", "n_reportable_subcortical"] == 14
+
+
+def test_subcortical_extraction_leaves_cortical_outputs_and_eligibility_unchanged(formal, cohort):
+    out, _ = formal
+    dk = pd.read_csv(out / "HUASHAN_NATIVE_DK.csv", nrows=1)
+    assert sum(c.endswith("_med") for c in dk.columns) == 68 and sum(c.endswith("_mean") for c in dk.columns) == 68
+    assert not any(c.startswith(("L_Thalamus", "R_Thalamus", "L_Putamen")) for c in dk.columns)
+    cov = pd.read_csv(out / "native_roi_coverage.csv")
+    assert cov["ROI"].nunique() == 68 and len(pd.read_csv(out / "native_label_mapping.csv")) == 68
+    info = json.loads((out / "HUASHAN_NATIVE_DK_run_info.json").read_text())
+    assert list(info["subcortical_rois"]) == SUBCORTICAL_COLUMNS
+    assert info["counts"]["analysis_pass"] == sum(v is True for v in COHORT.values())
