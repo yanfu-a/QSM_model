@@ -3,10 +3,16 @@ import argparse
 import itertools
 import pandas as pd
 from SurrealGAN.Surreal_GAN_representation_learning import repetitive_representation_learning
+from check_model_training import largest_batchsize, steps_per_epoch
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task_id", type=int, required=True, help="0-based task index, range: 0-1349")
+    parser.add_argument("--task_id", type=int, required=True,
+                        help="0-based task index: 0 to (configurations x repetitions - 1), "
+                             "i.e. 0-2249 for the current grid (45 x 50)")
+    parser.add_argument("--batchsize", type=int, default=300,
+                        help="batch size; must leave at least one training step per epoch "
+                             "(checked before training; see check_model_training.py)")
     args = parser.parse_args()
 
     # =========================
@@ -20,7 +26,7 @@ def main():
 
     # =========================
     # =========================
-    batchsize = 300
+    batchsize = args.batchsize
     lr = 0.0008
     repetition = 50
 
@@ -28,6 +34,17 @@ def main():
     if tar_size == 0:
         raise ValueError("diagnosis == 1 的 TAR 组样本数为 0，请检查输入数据。")
     final_saving_epoch = int(1500000 * (batchsize / tar_size))
+
+    # SurrealGAN's patient iterator runs int(n_patients / batchsize) - 1 steps per epoch, so a
+    # batch size above half the patients means no training at all: the networks keep their random
+    # initial weights, every saved epoch is identical, and Rindices_corr never changes.
+    steps = steps_per_epoch(train_data, batchsize)
+    if steps < 1:
+        raise ValueError(
+            f"batchsize={batchsize} gives {steps} training steps per epoch with {tar_size} patients, "
+            f"so the model would never train. Use --batchsize {largest_batchsize(train_data, 1)} or "
+            f"smaller ({largest_batchsize(train_data, 3)} or smaller gives at least 3 steps per epoch)."
+        )
 
     # =========================
     # =========================
@@ -56,6 +73,7 @@ def main():
     print(f"grid_idx = {grid_idx}, repetition = {rep_idx}")
     print(f"模式数(M): {npattern} | Lambda: {lam} | Gamma: {gamma}")
     print(f"自适应 Epochs: {final_saving_epoch}")
+    print(f"Batch size: {batchsize} | training steps per epoch: {steps}")
     print(f"输出目录: {current_out_dir}")
 
     repetitive_representation_learning(
