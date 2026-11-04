@@ -208,14 +208,14 @@ def main(image_dir, image_dir_add, recron_image_dir, train_csv, clinical_csv, va
 
 if __name__ == '__main__':
     config = {
-        'image_dir': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/multidisease/huashan_dataset',
-        'image_dir_add': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/data_add',
-        'recron_image_dir': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/results/000-DiT-UKB-L-256-finetune_mode-full/evaluations/step_40000',
-        'train_csv': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/labels/label_id_0_6/classification_train.csv',
-        'clinical_csv': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/labels/label_id_0_6/sr_pending_clinical.csv',
-        'val_csv': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/labels/label_id_0_6/classification_val.csv',
-        'test_csv': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/labels/label_id_0_6/classification_test.csv',
-        'model_save_dir': '/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/huanshan_multidisease/GenBrain_sr/classification/results_add_step_40k_lr_1e-4_label_id_0_6',
+        'image_dir': '/path_to/',
+        'image_dir_add': '/path_to/',
+        'recron_image_dir': '/path_to/',
+        'train_csv': '/path_to/',
+        'clinical_csv': '/path_to/',
+        'val_csv': '/path_to/',
+        'test_csv': '/path_to/',
+        'model_save_dir': '/path_to/',
         'n_classes': 7,
         'batch_size': 16,
         'lr': 1e-4,
