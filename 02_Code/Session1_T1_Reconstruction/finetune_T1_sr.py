@@ -275,12 +275,12 @@ def main(args):
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, default="/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/multidisease/huashan_dataset")
-    parser.add_argument("--data_add_path", type=str, default="/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/data_add")
-    parser.add_argument("--data_file", type=str, default="/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/labels/label_id_0_6/sr_train_pairs.csv")
-    parser.add_argument("--data_info", type=str, default="/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/BrainGen/yc_code/multimodal_foundation_model_full_v3/labels/data_info.json")
+    parser.add_argument("--data_path", type=str, default="/path_to/")
+    parser.add_argument("--data_add_path", type=str, default="/path_to/")
+    parser.add_argument("--data_file", type=str, default="/path_to/")
+    parser.add_argument("--data_info", type=str, default="/path_to/")
     parser.add_argument("--epochs", type=int, default=3130)
-    parser.add_argument("--results_dir", type=str, default="/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/yc_23110850041/huanshan_multidisease/results")
+    parser.add_argument("--results_dir", type=str, default="/path_to/")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-UKB-L/256")
     parser.add_argument("--global-batch-size", type=int, default=32)  # 512
     parser.add_argument("--global-seed", type=int, default=0)
@@ -289,7 +289,7 @@ if __name__ == "__main__":
 
     # Arguments for finetune
     parser.add_argument("--ckpt_epoch", type=int, default=200, help="Epoch number to checkpoint")
-    parser.add_argument("--ckpt_path", type=str, default='/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/BrainGen/multimodal_foundation_model/model_full_v3/000-DiT-UKB-L-256')
+    parser.add_argument("--ckpt_path", type=str, default='/path_to/')
     parser.add_argument("--finetune_mode", type=str, choices=['full','part','new_module'],default='full')
     parser.add_argument("--finetune_block", type=list, default=[20,21,22,23])
 
