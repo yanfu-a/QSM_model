@@ -24,10 +24,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EIDS = PROJECT_ROOT / "labels/ukb_labels/ukb_t1_sub.csv"
 DEFAULT_LABELS = PROJECT_ROOT / "labels/label_id_0_6/classification_train.csv"
 DEFAULT_IMAGES = Path(
-    "/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/gongwk/ukb_multimodal_new"
+    "/path_to/"
 )
 DEFAULT_MASK = Path(
-    "/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/"
+    "/path_to/"
     "BrainGen/yc_code/preprocess/MNI152_T1_2mm_brain.nii.gz"
 )
 DEFAULT_WEIGHTS = (
