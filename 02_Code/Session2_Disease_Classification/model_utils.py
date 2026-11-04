@@ -6,7 +6,7 @@ import nibabel as nib
 import os
 import random
 
-mask = nib.load('/cpfs01/projects-HDD/cfff-afe2df89e32e_HDD/public/work_files_yc/BrainGen/yc_code/preprocess/MNI152_T1_2mm_brain.nii.gz')
+mask = nib.load('/path_to/')
 mask_data = mask.get_fdata()
 nonzero = mask_data.nonzero()
 
