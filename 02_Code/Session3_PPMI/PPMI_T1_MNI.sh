@@ -3,69 +3,75 @@
 set -euo pipefail
 
 # ==========================================================
-# 1. Environment
+# 1. External arguments
+# ==========================================================
+
+if [[ $# -lt 2 ]]; then
+    echo "Usage:"
+    echo "bash $0 START_INDEX END_INDEX [JOBS]"
+    echo
+    echo "Example:"
+    echo "bash $0 1 100 4"
+    exit 1
+fi
+
+START_INDEX="$1"
+END_INDEX="$2"
+JOBS="${3:-4}"
+
+# Validate arguments
+for value in "$START_INDEX" "$END_INDEX" "$JOBS"; do
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Arguments must be positive integers."
+        exit 1
+    fi
+done
+
+if [[ "$START_INDEX" -lt 1 ]] ||
+   [[ "$END_INDEX" -lt "$START_INDEX" ]] ||
+   [[ "$JOBS" -lt 1 ]]; then
+    echo "ERROR: Invalid start, end or jobs."
+    exit 1
+fi
+
+# ==========================================================
+# 2. Environment
 # ==========================================================
 
 module load fsl
 
 export FSLOUTPUTTYPE=NIFTI_GZ
-
-# 避免多进程与程序内部线程过度竞争
 export OMP_NUM_THREADS=1
 
 # ==========================================================
-# 2. Path configuration
+# 3. Path configuration
 # ==========================================================
 
-# 已经通过 dcm2niix 转换的 NIfTI
 INPUT_ROOT="/cwStorage/nodecw_group/FY_data/PPMI/T1_nifti"
 
-# MNI 2mm 输出目录
 OUTPUT_ROOT="/cwStorage/nodecw_group/FY_data/PPMI/T1_MNI2mm"
 
-# MNI152 2mm templates
 MNI_REF="$FSLDIR/data/standard/MNI152_T1_2mm.nii.gz"
 
 MNI_BRAIN="$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz"
 
-# FNIRT configuration
 FNIRT_CONFIG="$FSLDIR/etc/flirtsch/T1_2_MNI152_2mm.cnf"
 
-# ==========================================================
-# 3. Processing parameters
-# ==========================================================
-
-# 并行任务数
-JOBS="${JOBS:-4}"
-
-# BET fractional intensity threshold
+# BET parameter
 BET_F="${BET_F:-0.25}"
 
-# 是否进行 robustfov
-# 1 = 裁剪颈部
-# 0 = 保留原始 FOV
-USE_ROBUSTFOV="${USE_ROBUSTFOV:-1}"
-
-# 是否进行 fslreorient2std
-# 默认关闭，避免掩盖错误的方向信息
-REORIENT="${REORIENT:-0}"
-
-# 可选：指定序列名称关键词
-# 空字符串表示处理所有 NIfTI
+# Optional sequence filter
 SERIES_FILTER="${SERIES_FILTER:-}"
 
 # ==========================================================
 # 4. Environment checks
 # ==========================================================
 
-for cmd in fslhd fslreorient2std robustfov bet \
-           flirt fnirt applywarp; do
-
+for cmd in fslhd bet flirt fnirt applywarp; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Cannot find $cmd"
         exit 1
     }
-
 done
 
 [[ -d "$INPUT_ROOT" ]] || {
@@ -79,7 +85,7 @@ done
 }
 
 [[ -f "$MNI_BRAIN" ]] || {
-    echo "ERROR: MNI brain template does not exist"
+    echo "ERROR: MNI brain reference does not exist"
     exit 1
 }
 
@@ -88,34 +94,88 @@ done
     exit 1
 }
 
-[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
-    echo "ERROR: JOBS must be a positive integer"
-    exit 1
-}
-
 mkdir -p "$OUTPUT_ROOT"
 
 RUN_ID=$(date +%Y%m%d_%H%M%S)
 
-STATUS_DIR="$OUTPUT_ROOT/_status_$RUN_ID"
+STATUS_DIR="$OUTPUT_ROOT/_status_${RUN_ID}"
 
 mkdir -p "$STATUS_DIR"
 
 export INPUT_ROOT OUTPUT_ROOT STATUS_DIR
-export MNI_REF MNI_BRAIN FNIRT_CONFIG
-export BET_F USE_ROBUSTFOV REORIENT
+export MNI_REF MNI_BRAIN FNIRT_CONFIG BET_F
 
 # ==========================================================
-# 5. Registration function
+# 5. Build sorted NIfTI file list
+# Compatible with older Bash versions
+# ==========================================================
+
+echo "Building NIfTI file list..."
+
+FILES=()
+
+if [[ -n "$SERIES_FILTER" ]]; then
+
+    while IFS= read -r -d '' file; do
+        FILES+=("$file")
+    done < <(
+        find "$INPUT_ROOT" \
+            -type f \
+            -name '*.nii.gz' \
+            -path "*${SERIES_FILTER}*" \
+            -print0 |
+        sort -z
+    )
+
+else
+
+    while IFS= read -r -d '' file; do
+        FILES+=("$file")
+    done < <(
+        find "$INPUT_ROOT" \
+            -type f \
+            -name '*.nii.gz' \
+            -print0 |
+        sort -z
+    )
+
+fi
+
+TOTAL_FILES=${#FILES[@]}
+
+if [[ "$TOTAL_FILES" -eq 0 ]]; then
+    echo "ERROR: No NIfTI files found."
+    exit 1
+fi
+
+if [[ "$START_INDEX" -gt "$TOTAL_FILES" ]]; then
+    echo "ERROR: START_INDEX exceeds total number of files."
+    exit 1
+fi
+
+if [[ "$END_INDEX" -gt "$TOTAL_FILES" ]]; then
+    echo "ERROR: END_INDEX exceeds total number of files."
+    exit 1
+fi
+
+SELECTED_COUNT=$((END_INDEX - START_INDEX + 1))
+
+SELECTED_FILES=(
+    "${FILES[@]:$((START_INDEX - 1)):$SELECTED_COUNT}"
+)
+
+echo "Total NIfTI files: $TOTAL_FILES"
+echo "Start index: $START_INDEX"
+echo "End index: $END_INDEX"
+echo "Selected files: ${#SELECTED_FILES[@]}"
+
+# ==========================================================
+# 6. Registration function
 # ==========================================================
 
 register_one() {
 
     local input_file="$1"
-
-    # ------------------------------------------------------
-    # A. Input information
-    # ------------------------------------------------------
 
     local relative_path="${input_file#"$INPUT_ROOT"/}"
 
@@ -129,7 +189,6 @@ register_one() {
 
     local output_dir="$OUTPUT_ROOT/$relative_dir"
 
-    mkdir -p "$output_dir"
     mkdir -p "$output_dir/transforms"
 
     local key
@@ -137,16 +196,16 @@ register_one() {
           md5sum | awk '{print $1}')
 
     # ------------------------------------------------------
-    # B. Output files
+    # Output files
     # ------------------------------------------------------
 
     local MNI_OUT="$output_dir/${base}_MNI2mm.nii.gz"
 
-    local BRAIN_OUT="$output_dir/${base}_brain_MNI2mm.nii.gz"
-
-    local MASK_OUT="$output_dir/${base}_brain_mask_MNI2mm.nii.gz"
-
     local LINEAR_OUT="$output_dir/${base}_linear_brain_MNI2mm.nii.gz"
+
+    local NATIVE_MASK_OUT="$output_dir/${base}_brain_mask_native.nii.gz"
+
+    local MNI_MASK_OUT="$output_dir/${base}_brain_mask_MNI2mm.nii.gz"
 
     local AFFINE_OUT="$output_dir/transforms/${base}_to_MNI2mm_affine.mat"
 
@@ -155,13 +214,13 @@ register_one() {
     local LOG_FILE="$output_dir/${base}_registration.log"
 
     # ------------------------------------------------------
-    # C. Skip completed subjects
+    # Skip completed files
     # ------------------------------------------------------
 
     if [[ -s "$MNI_OUT" ]] &&
-       [[ -s "$BRAIN_OUT" ]] &&
-       [[ -s "$MASK_OUT" ]] &&
        [[ -s "$LINEAR_OUT" ]] &&
+       [[ -s "$NATIVE_MASK_OUT" ]] &&
+       [[ -s "$MNI_MASK_OUT" ]] &&
        [[ -s "$AFFINE_OUT" ]] &&
        [[ -s "$WARP_OUT" ]]; then
 
@@ -172,20 +231,18 @@ register_one() {
         return 0
     fi
 
-    echo
     echo "[START] $relative_path"
 
+    local START_TIME
+    START_TIME=$(date +%s)
+
     # ------------------------------------------------------
-    # D. Temporary working directory
+    # Temporary directory
     # ------------------------------------------------------
 
     local WORK_DIR
 
     WORK_DIR=$(mktemp -d "$output_dir/.work_${base}.XXXXXX")
-
-    local REORIENT_IMG="$WORK_DIR/T1_reorient.nii.gz"
-
-    local CROPPED_IMG="$WORK_DIR/T1_cropped.nii.gz"
 
     local BRAIN_IMG="$WORK_DIR/T1_brain.nii.gz"
 
@@ -199,137 +256,69 @@ register_one() {
 
     local MNI_TMP="$WORK_DIR/T1_MNI2mm.nii.gz"
 
-    local BRAIN_MNI_TMP="$WORK_DIR/T1_brain_MNI2mm.nii.gz"
-
-    local MASK_MNI_TMP="$WORK_DIR/T1_brain_mask_MNI2mm.nii.gz"
+    local MNI_MASK_TMP="$WORK_DIR/T1_brain_mask_MNI2mm.nii.gz"
 
     echo "Input: $input_file" > "$LOG_FILE"
 
-    echo "Start: $(date)" >> "$LOG_FILE"
-
     # ------------------------------------------------------
-    # E. Header QC
+    # Step 1. Header QC
     # ------------------------------------------------------
 
-    local header
+    local HEADER
 
-    if ! header=$(fslhd "$input_file" 2>>"$LOG_FILE"); then
+    if ! HEADER=$(fslhd "$input_file" 2>>"$LOG_FILE"); then
 
         touch "$STATUS_DIR/${key}.failed"
 
         echo "[FAILED HEADER] $relative_path"
 
-        echo "Work directory: $WORK_DIR"
-
         return 0
-
     fi
 
-    local qform_code
-    local sform_code
-    local dim0
-    local dim4
+    local QFORM_CODE
+    local SFORM_CODE
+    local DIM0
+    local DIM4
 
-    qform_code=$(awk '$1=="qform_code"{print $2}' <<< "$header")
+    QFORM_CODE=$(awk '$1=="qform_code"{print $2}' <<< "$HEADER")
 
-    sform_code=$(awk '$1=="sform_code"{print $2}' <<< "$header")
+    SFORM_CODE=$(awk '$1=="sform_code"{print $2}' <<< "$HEADER")
 
-    dim0=$(awk '$1=="dim0"{print $2}' <<< "$header")
+    DIM0=$(awk '$1=="dim0"{print $2}' <<< "$HEADER")
 
-    dim4=$(awk '$1=="dim4"{print $2}' <<< "$header")
+    DIM4=$(awk '$1=="dim4"{print $2}' <<< "$HEADER")
 
-    if [[ "${qform_code:-0}" -eq 0 ]] &&
-       [[ "${sform_code:-0}" -eq 0 ]]; then
+    if [[ "${QFORM_CODE:-0}" -eq 0 ]] &&
+       [[ "${SFORM_CODE:-0}" -eq 0 ]]; then
 
-        echo "ERROR: Both qform and sform are invalid" >> "$LOG_FILE"
+        echo "Invalid qform/sform" >> "$LOG_FILE"
 
         touch "$STATUS_DIR/${key}.failed"
 
-        echo "[FAILED ORIENTATION] $relative_path"
+        echo "[FAILED HEADER] $relative_path"
 
         return 0
-
     fi
 
-    if [[ "${dim0:-0}" -ne 3 ]] ||
-       [[ "${dim4:-0}" -ne 1 ]]; then
+    if [[ "${DIM0:-0}" -ne 3 ]] ||
+       [[ "${DIM4:-0}" -ne 1 ]]; then
 
-        echo "ERROR: Only 3D T1 images are accepted" >> "$LOG_FILE"
+        echo "Only 3D images are accepted" >> "$LOG_FILE"
 
         touch "$STATUS_DIR/${key}.failed"
 
         echo "[FAILED DIMENSION] $relative_path"
 
         return 0
-
     fi
 
     # ------------------------------------------------------
-    # F. Optional orientation reorientation
-    # ------------------------------------------------------
-
-    local CURRENT_IMG="$input_file"
-
-    if [[ "$REORIENT" == "1" ]]; then
-
-        if ! fslreorient2std \
-            "$input_file" \
-            "$REORIENT_IMG" >> "$LOG_FILE" 2>&1; then
-
-            touch "$STATUS_DIR/${key}.failed"
-
-            echo "[FAILED REORIENT] $relative_path"
-
-            echo "Work directory: $WORK_DIR"
-
-            return 0
-
-        fi
-
-        CURRENT_IMG="$REORIENT_IMG"
-
-    fi
-
-    # ------------------------------------------------------
-    # G. Crop neck
-    # ------------------------------------------------------
-
-    if [[ "$USE_ROBUSTFOV" == "1" ]]; then
-
-        if ! robustfov \
-            -i "$CURRENT_IMG" \
-            -r "$CROPPED_IMG" >> "$LOG_FILE" 2>&1; then
-
-            touch "$STATUS_DIR/${key}.failed"
-
-            echo "[FAILED ROBUSTFOV] $relative_path"
-
-            echo "Work directory: $WORK_DIR"
-
-            return 0
-
-        fi
-
-    else
-
-        if ! cp "$CURRENT_IMG" "$CROPPED_IMG"; then
-
-            touch "$STATUS_DIR/${key}.failed"
-
-            echo "[FAILED COPY] $relative_path"
-
-            return 0
-
-        fi
-
-    fi
-
-    # ------------------------------------------------------
-    # H. Brain extraction
+    # Step 2. Brain extraction
+    # Keep original T1 geometry unchanged.
     # ------------------------------------------------------
 
     if ! bet \
-        "$CROPPED_IMG" \
+        "$input_file" \
         "$BRAIN_IMG" \
         -R \
         -f "$BET_F" \
@@ -342,7 +331,6 @@ register_one() {
         echo "Work directory: $WORK_DIR"
 
         return 0
-
     fi
 
     if [[ ! -s "$BRAIN_IMG" ]] ||
@@ -352,14 +340,11 @@ register_one() {
 
         echo "[FAILED BET OUTPUT] $relative_path"
 
-        echo "Work directory: $WORK_DIR"
-
         return 0
-
     fi
 
     # ------------------------------------------------------
-    # I. FLIRT linear registration
+    # Step 3. FLIRT linear registration
     # ------------------------------------------------------
 
     if ! flirt \
@@ -377,19 +362,24 @@ register_one() {
         echo "Work directory: $WORK_DIR"
 
         return 0
-
     fi
 
     # ------------------------------------------------------
-    # J. FNIRT nonlinear registration
+    # Step 4. FNIRT nonlinear registration
+    #
+    # --in: original native T1
+    # --aff: FLIRT affine matrix
+    # --cout: nonlinear warp coefficients
+    # --iout: final MNI T1
     # ------------------------------------------------------
 
     if ! fnirt \
-        --in="$CROPPED_IMG" \
+        --in="$input_file" \
         --aff="$AFFINE_TMP" \
         --ref="$MNI_REF" \
         --config="$FNIRT_CONFIG" \
-        --cout="$WARP_TMP" >> "$LOG_FILE" 2>&1; then
+        --cout="$WARP_TMP" \
+        --iout="$MNI_TMP" >> "$LOG_FILE" 2>&1; then
 
         touch "$STATUS_DIR/${key}.failed"
 
@@ -398,192 +388,123 @@ register_one() {
         echo "Work directory: $WORK_DIR"
 
         return 0
-
     fi
 
     # ------------------------------------------------------
-    # K. Apply nonlinear transformation
+    # Step 5. Apply nonlinear transformation to brain mask
     # ------------------------------------------------------
 
-    # Full cropped T1
-    if ! applywarp \
-        --in="$CROPPED_IMG" \
-        --ref="$MNI_REF" \
-        --warp="$WARP_TMP" \
-        --out="$MNI_TMP" \
-        --interp=spline >> "$LOG_FILE" 2>&1; then
-
-        touch "$STATUS_DIR/${key}.failed"
-
-        echo "[FAILED APPLYWARP T1] $relative_path"
-
-        echo "Work directory: $WORK_DIR"
-
-        return 0
-
-    fi
-
-    # Brain-only T1
-    if ! applywarp \
-        --in="$BRAIN_IMG" \
-        --ref="$MNI_REF" \
-        --warp="$WARP_TMP" \
-        --out="$BRAIN_MNI_TMP" \
-        --interp=spline >> "$LOG_FILE" 2>&1; then
-
-        touch "$STATUS_DIR/${key}.failed"
-
-        echo "[FAILED APPLYWARP BRAIN] $relative_path"
-
-        echo "Work directory: $WORK_DIR"
-
-        return 0
-
-    fi
-
-    # Brain mask: nearest-neighbour interpolation
     if ! applywarp \
         --in="$BRAIN_MASK" \
         --ref="$MNI_REF" \
         --warp="$WARP_TMP" \
-        --out="$MASK_MNI_TMP" \
+        --out="$MNI_MASK_TMP" \
         --interp=nn >> "$LOG_FILE" 2>&1; then
 
         touch "$STATUS_DIR/${key}.failed"
 
-        echo "[FAILED APPLYWARP MASK] $relative_path"
+        echo "[FAILED APPLYWARP] $relative_path"
 
         echo "Work directory: $WORK_DIR"
 
         return 0
-
     fi
 
     # ------------------------------------------------------
-    # L. Verify output dimensions
+    # Step 6. Output QC
     # ------------------------------------------------------
 
-    local ref_dims
-    local out_dims
+    local REF_DIMS
+    local OUT_DIMS
 
-    ref_dims=$(fslhd "$MNI_REF" |
-        awk '$1=="dim1" || $1=="dim2" || $1=="dim3" {printf "%s ",$2}')
+    REF_DIMS=$(fslhd "$MNI_REF" |
+        awk '$1=="dim1"{a=$2} $1=="dim2"{b=$2} $1=="dim3"{c=$2} END{print a,b,c}')
 
-    out_dims=$(fslhd "$MNI_TMP" |
-        awk '$1=="dim1" || $1=="dim2" || $1=="dim3" {printf "%s ",$2}')
+    OUT_DIMS=$(fslhd "$MNI_TMP" |
+        awk '$1=="dim1"{a=$2} $1=="dim2"{b=$2} $1=="dim3"{c=$2} END{print a,b,c}')
 
-    if [[ "$ref_dims" != "$out_dims" ]]; then
+    if [[ "$REF_DIMS" != "$OUT_DIMS" ]]; then
 
-        echo "ERROR: Output dimensions do not match MNI reference" >> "$LOG_FILE"
+        echo "MNI dimensions mismatch" >> "$LOG_FILE"
 
         touch "$STATUS_DIR/${key}.failed"
 
         echo "[FAILED DIMENSION QC] $relative_path"
 
-        echo "Work directory: $WORK_DIR"
-
         return 0
-
     fi
 
     # ------------------------------------------------------
-    # M. Save final outputs
+    # Step 7. Save outputs
     # ------------------------------------------------------
+
+    cp "$BRAIN_MASK" "$NATIVE_MASK_OUT"
 
     mv "$MNI_TMP" "$MNI_OUT"
 
-    mv "$BRAIN_MNI_TMP" "$BRAIN_OUT"
-
-    mv "$MASK_MNI_TMP" "$MASK_OUT"
-
     mv "$LINEAR_TMP" "$LINEAR_OUT"
+
+    mv "$MNI_MASK_TMP" "$MNI_MASK_OUT"
 
     mv "$AFFINE_TMP" "$AFFINE_OUT"
 
     mv "$WARP_TMP" "$WARP_OUT"
 
-    # Clean temporary directory after success
     rm -rf "$WORK_DIR"
 
-    echo "Finish: $(date)" >> "$LOG_FILE"
+    local END_TIME
+    END_TIME=$(date +%s)
+
+    local ELAPSED=$((END_TIME - START_TIME))
+
+    echo "Elapsed time: ${ELAPSED} seconds" >> "$LOG_FILE"
 
     touch "$STATUS_DIR/${key}.success"
 
-    echo "[SUCCESS] $relative_path"
+    echo "[SUCCESS] $relative_path (${ELAPSED}s)"
 
 }
 
 export -f register_one
 
 # ==========================================================
-# 6. Parallel registration
+# 7. Parallel execution
 # ==========================================================
 
-echo
-echo "=========================================="
-echo "PPMI T1 MNI152 2mm Registration"
-echo "=========================================="
-
-echo "Input: $INPUT_ROOT"
-echo "Output: $OUTPUT_ROOT"
-echo "MNI: $MNI_REF"
-echo "FNIRT config: $FNIRT_CONFIG"
-echo "Jobs: $JOBS"
-echo "=========================================="
-
-if [[ -n "$SERIES_FILTER" ]]; then
-
-    find "$INPUT_ROOT" \
-        -type f \
-        -name '*.nii.gz' \
-        -path "*${SERIES_FILTER}*" \
-        -print0 |
-
-    xargs -0 -r -n 1 -P "$JOBS" \
-        bash -c 'register_one "$1"' _
-
-else
-
-    find "$INPUT_ROOT" \
-        -type f \
-        -name '*.nii.gz' \
-        -print0 |
-
-    xargs -0 -r -n 1 -P "$JOBS" \
-        bash -c 'register_one "$1"' _
-
-fi
+printf '%s\0' "${SELECTED_FILES[@]}" |
+xargs -0 -r -n 1 -P "$JOBS" \
+    bash -c 'register_one "$1"' _
 
 # ==========================================================
-# 7. Summary
+# 8. Summary
 # ==========================================================
 
-success=$(find "$STATUS_DIR" -type f -name '*.success' | wc -l)
+SUCCESS=$(find "$STATUS_DIR" -type f -name '*.success' | wc -l)
 
-failed=$(find "$STATUS_DIR" -type f -name '*.failed' | wc -l)
+FAILED=$(find "$STATUS_DIR" -type f -name '*.failed' | wc -l)
 
-skipped=$(find "$STATUS_DIR" -type f -name '*.skipped' | wc -l)
+SKIPPED=$(find "$STATUS_DIR" -type f -name '*.skipped' | wc -l)
 
-total=$((success + failed + skipped))
+TOTAL=$((SUCCESS + FAILED + SKIPPED))
 
 echo
 echo "=========================================="
 echo "Registration completed"
 echo "=========================================="
 
-echo "Total: $total"
-echo "Success: $success"
-echo "Skipped: $skipped"
-echo "Failed: $failed"
+echo "Available files: $TOTAL_FILES"
+echo "Selected range: $START_INDEX - $END_INDEX"
+echo "Selected files: $SELECTED_COUNT"
+echo "Success: $SUCCESS"
+echo "Failed: $FAILED"
+echo "Skipped: $SKIPPED"
 
-if [[ "$total" -gt 0 ]]; then
-
-    awk -v s="$success" -v t="$total" \
+if [[ "$TOTAL" -gt 0 ]]; then
+    awk -v s="$SUCCESS" -v t="$TOTAL" \
         'BEGIN {printf "Success rate: %.2f%%\n", s/t*100}'
-
 fi
 
-echo "Output directory: $OUTPUT_ROOT"
-echo "Status directory: $STATUS_DIR"
+echo "Output: $OUTPUT_ROOT"
+echo "Status: $STATUS_DIR"
 
 echo "=========================================="
