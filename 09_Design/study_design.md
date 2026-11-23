@@ -168,7 +168,7 @@ uses as its reference standard.
 | Cohort | Mapped to a class | Not mapped (secondary analyses) | Reference standard |
 |---|---|---|---|
 | ADNI | CN → REF; AD dementia → AD. ADNI has no clinical diagnoses of other dementias, so no participant is mapped to DLB, FTD, PSP or MSA | MCI (prognostic analysis); SMC | Clinical diagnosis (primary); amyloid and tau status (biomarker evidence); CSF α-synuclein SAA and NfL (biomarker evidence); neuropathology (pathological evidence). Biomarker and pathology groups are never relabelled as clinical diagnoses (section 7.2) |
-| PPMI | HC → REF; PD → PD | Prodromal; SWEDD (analysed separately) | Clinical diagnosis (primary); DAT-deficit-confirmed PD (sensitivity) |
+| PPMI | Confirmed HC → REF; PD → PD; clinical MSA, PSP, DLB, AD, FTD diagnoses → matching class (descriptive) | Prodromal; SWEDD; CBS; other neurological disorders; unaffected carriers | Research diagnosis at the scan date (Appendix A); DaTscan and SAA as biomarker evidence only |
 | UKB | No target disease → REF-like; PD (G20) → PD; AD (G30/F00) → AD | MSA, PSP, FTD, DLB (descriptive only) | ICD-10 / primary care / death registry with dates |
 
 Baseline visit is the primary scan in ADNI and PPMI. A participant's diagnosis
@@ -392,6 +392,10 @@ analyses that could not be run.
   separately, by biomarker group and by pathology category.
 
 ### 7.3 PPMI
+Scan-level labels follow Appendix A: each scan is labelled from the clinical
+records dated on or before its acquisition, with flags for transitional,
+revised, conflicting or uncertain labels.
+
 - **Primary:** PD vs HC discrimination of the pairwise PD score at baseline.
 - **Secondary:**
   - DAT-deficit-confirmed PD vs HC.
@@ -566,3 +570,226 @@ Order of work:
 7. Whether additional cohorts (for example NIFD/FTLDNI or 4RTNI for FTD and
    PSP) can be obtained; otherwise MSA, PSP, DLB and FTD are validated only
    internally.
+
+## Appendix A. PPMI scan-level disease labeling
+
+This appendix defines how each PPMI T1 scan receives a disease label from the
+clinical records dated around its acquisition. It is a design only: no
+labels have been computed. Field names and codes below come from the PPMI
+harmonized data dictionary and code list in `01_Data/PPMI/` (11 Nov 2026).
+
+### A.1 Source files
+
+**Already in `01_Data/PPMI/`:**
+
+| File | Fields used | Role |
+|---|---|---|
+| `PPMI_selected_scans.csv` | `subject_id` (= `PATNO`), `exam_date`, `exam_key`, `selected_mni2mm_nifti`, `acceptable_scan_count`, `pending_scan_count`, `flagged_scan_count` | One row per MRI exam; defines the scans to label and their QC status |
+| `Participant_Status_11Nov2026.csv` | `COHORT`, `ENROLL_DATE`, `ENROLL_STATUS`, `STATUS_DATE`, enrollment subgroup flags (`ENRLSRDC`, `ENRLLRRK2`, `ENRLGBA`, `ENRLSNCA`, `ENRLPRKN`, `ENRLPINK1`, `ENRLOTHGV`, `ENRLHPSM`, `ENRLRBD`, `ENRLNORM`), `DATELIG` | Enrollment cohort and date; fallback label at enrollment |
+| Data dictionary and code list | — | Code definitions for all fields below |
+
+**Required from PPMI but not yet uploaded:**
+
+| PPMI table (module) | Fields used | Role |
+|---|---|---|
+| Primary Research Diagnosis (`PRIMDXPD`) | `PATNO`, `EVENT_ID`, `INFODT`, `PRIMDIAG`, `DXLVL`, `BIORV`, `DATSCAN`, `ASYNSAA`, `NEWDIAGEXP`, `PAG_NAME` | Site investigator's most likely primary diagnosis and its confidence, by visit |
+| Clinical Diagnosis (`NEWCLINDX`) | `PATNO`, `EVENT_ID`, `INFODT`, `NEWDIAG`, `DIAGDT`, `DIAGSINLV`, `DIAGCHANGEXP` | Diagnosis changes during follow-up, with the date of the new diagnosis |
+| PD Diagnosis History (`PDDXHIST`) | `PATNO`, `PDDXDT`, `SXDT` | Date of PD diagnosis (including for prodromal participants who convert) |
+| Visit Status (`VISSTAT`) | `PATNO`, `EVENT_ID`, `EVENT_START`, `INFODT`, `VISCMPLT` | Visit dates, to check the dates of diagnosis records |
+| MRI acquisition metadata (`XI_MRI_ACQUISITION`) | `PATNO`, `EVENT_ID`, `MRI_SCAN_DATE`, `MRI_SEQ_T1_WEIGHTED` | Links each scan to a visit ID |
+| Conclusion of Study Participation (`CONCL`) | `WDDT`, `WDDEATH` | End of follow-up |
+| DaTscan visual read and SBR (`XI_DATSCAN_VI_RESULTS`, `XI_DATSCAN_SBR`) | `DATSCAN_DATE`, `DATSCAN_VISINTRP`, SBR values | Biomarker evidence only (A.6) |
+| α-synuclein SAA (`SAA`) | `CLINICAL_EVENT`, `TYPE`, `SAA_Status`, `RUNDATE` | Biomarker evidence only (A.6) |
+| Pathology Core (`PATHCORE`) and any released neuropathology | `PATHDOD`, `AUTDT`, `PCSTATUS` | Death date; pathology, if released, as separate evidence |
+
+### A.2 Principles
+
+1. **The label describes clinical status at the scan date.** It is taken from
+   the most recent diagnostic record dated on or before the scan, without
+   using information from later visits. A separate *final diagnosis* (A.5) is
+   kept for sensitivity analyses that do use later information.
+2. **Research diagnosis takes precedence over enrollment cohort.** `COHORT`
+   records why a participant was enrolled, not their current diagnosis. It is
+   used only when no diagnostic record exists on or before the scan.
+3. **Labels are clinical.** DaTscan, SAA and pathology never change a label.
+   They are stored next to it as biomarker or pathological evidence, as in
+   the ADNI design.
+4. **Dates are compared at month resolution.** PPMI clinical dates are
+   recorded as month and year (`MM/YYYY`), while scan dates have a day. All
+   comparisons use calendar months. A record in the same month as the scan
+   counts as concurrent (A.4, rule 4).
+5. **Every scan gets a label, a source and flags.** Scans are never silently
+   dropped; analysis sets are defined later by eligibility flags (A.8).
+
+### A.3 Diagnosis events per participant
+
+For each participant, build a dated list of diagnosis events:
+
+| Event source | Diagnosis | Effective date |
+|---|---|---|
+| Enrollment | `COHORT` mapped as in A.7 | `ENROLL_DATE` |
+| `PRIMDXPD` | `PRIMDIAG` | `INFODT` |
+| `NEWCLINDX` | `NEWDIAG` | `DIAGDT` if recorded; otherwise see rule 3 |
+| `PDDXHIST` | Idiopathic PD | `PDDXDT` |
+
+When two sources disagree in the same month, the order of precedence is
+`NEWCLINDX` > `PRIMDXPD` > `PDDXHIST` > enrollment `COHORT`, and the
+disagreement is flagged (rule 8).
+
+### A.4 Rules for assigning the label at the scan date
+
+1. **Current label.** The label is the diagnosis of the most recent event with
+   an effective month on or before the scan month.
+2. **Enrollment fallback.** If the only event before the scan is enrollment,
+   the label comes from `COHORT`, with `label_source = cohort`. This is
+   accepted for scans within 6 months of `ENROLL_DATE` (the baseline
+   window). Later scans with only a cohort label are flagged
+   `unconfirmed_cohort_only`.
+3. **Diagnosis changes between visits.** `NEWCLINDX` records a change at a
+   visit, and `DIAGDT` gives the date of the new diagnosis.
+   - If `DIAGDT` is recorded, the new label applies from that month.
+   - If `DIAGDT` is missing and `DIAGSINLV = 1` (the change happened between
+     the previous visit and this one), the change month is unknown. Scans
+     between the two visits are labelled with the earlier diagnosis and
+     flagged `transitional`.
+   - If `DIAGDT` is missing and `DIAGSINLV = 0`, the change is dated to the
+     visit's `INFODT`.
+4. **Same month as a change.** If the scan falls in the same month as a
+   diagnosis change, the day order cannot be known. The scan is flagged
+   `transitional` and keeps the earlier label.
+5. **Prodromal conversion.** For participants enrolled as prodromal (or
+   unaffected genetic carriers) who later receive a PD or other diagnosis,
+   scans before the conversion month are labelled prodromal and those from
+   that month onward with the new diagnosis. Each scan stores the months to
+   conversion (negative before, positive after). Conversion is dated by
+   `NEWCLINDX.DIAGDT`, then `PDDXHIST.PDDXDT`, then the `INFODT` of the first
+   record of the new diagnosis.
+6. **Revised diagnoses.** If a later record replaces a diagnosis (for
+   example PD revised to MSA or PSP, explained in `NEWDIAGEXP` or
+   `DIAGCHANGEXP`), earlier scans keep the label that was current at the
+   time. They are also flagged `later_revised`, with the revised diagnosis
+   stored. These scans matter for PD vs atypical parkinsonism, because they
+   capture early misdiagnosis.
+7. **Unstable diagnoses.** A participant whose diagnosis changes more than
+   once, or returns to an earlier diagnosis, is flagged `unstable`. Their
+   scans keep the time-of-scan label and are removed in a sensitivity
+   analysis.
+8. **Conflicts.** If the enrollment cohort and the first research diagnosis
+   disagree (for example `COHORT` = Healthy Control but `PRIMDIAG` =
+   Idiopathic PD, or `COHORT` = PD but `PRIMDIAG` = 17 "No PD nor other
+   neurological disorder"), the research diagnosis is used and the scan is
+   flagged `conflict`. Conflicting scans are excluded from primary analyses
+   and listed for review.
+9. **Diagnostic confidence.** `DXLVL` from `PRIMDXPD` is carried with each
+   label. Primary analyses require confidence above 50% (`DXLVL` 1 or 2).
+   Labels with `DXLVL` 3 or 4 are flagged `low_confidence`. A sensitivity
+   analysis uses `DXLVL` = 1 only.
+10. **Stale labels.** If the most recent diagnostic record is more than 24
+    months before the scan, the scan is flagged `stale`. It keeps its label
+    but is excluded from primary analyses.
+11. **End of follow-up.** A scan dated after withdrawal (`WDDT`) or death is
+    flagged as a data error and excluded.
+12. **Missing information.** A scan with no diagnostic record and no
+    enrollment cohort, or a code that cannot be mapped, is labelled
+    `unknown` and excluded. Code 97 ("Other neurological disorder(s)") is
+    labelled `other_neurological` and the free text kept.
+
+### A.5 Final diagnosis (for sensitivity analyses only)
+
+Each participant also gets a final diagnosis: the most recent diagnosis at
+last contact, with its date and the follow-up time after each scan. This is
+used to:
+- define **confirmed healthy controls** (A.8);
+- identify scans taken before a later revision or conversion;
+- check whether results change when labels use all available information.
+
+The final diagnosis is never used as the primary label.
+
+### A.6 Biomarker and pathology evidence attached to each scan
+
+Stored next to the label, never used to change it:
+- **DaTscan:** result closest to the scan (visual read and SBR), with the
+  interval in months. Enrollment eligibility (`DATELIG`) is stored as well.
+- **α-synuclein SAA:** CSF result closest to the scan (`SAA_Status`:
+  positive, negative or inconclusive), with the interval. Inconclusive
+  results are kept as inconclusive.
+- **Pathology:** death date and, where released, neuropathology diagnosis.
+
+These fields define biomarker-supported subgroups (for example DaT-deficit
+PD, SAA-positive prodromal) for secondary analyses, as described in section
+7.3.
+
+### A.7 Mapping to labels and to model classes
+
+| PPMI source | Code | Scan label | Model class |
+|---|---|---|---|
+| `PRIMDIAG` / `NEWDIAG` | 1 Idiopathic PD | `PD` | PD |
+| | 17 No PD nor other neurological disorder | `no_disorder` | REF only if a confirmed healthy control (A.8) |
+| | 11 Multiple system atrophy | `MSA` | MSA |
+| | 14 Progressive supranuclear palsy | `PSP` | PSP |
+| | 5 Dementia with Lewy bodies | `DLB` | DLB |
+| | 2 Alzheimer's disease | `AD` | AD |
+| | 3 Frontotemporal dementia | `FTD` | FTD |
+| | 4 Corticobasal syndrome | `CBS` | No matching class |
+| | 23, 24, 25 Prodromal (non-motor, motor, synucleinopathy) | `prodromal` | No matching class |
+| | 6–10, 12, 13, 15, 16, 18 (other movement or neurological disorders) | `other_neurological` | No matching class |
+| | 97 Other neurological disorder(s) | `other_neurological` | No matching class |
+| `COHORT` (fallback only) | 1 Parkinson's Disease | `PD` | PD |
+| | 2 Healthy Control | `no_disorder` | REF only if confirmed (A.8) |
+| | 3 SWEDD | `SWEDD` | No matching class |
+| | 4 Prodromal | `prodromal` | No matching class |
+| | 7 Genetic Registry - PD | `PD`, flagged `genetic_registry` | PD (sensitivity analyses only) |
+| | 8 Genetic Registry - Unaffected | `unaffected_carrier` | No matching class |
+
+Additional attributes stored per scan: enrollment subgroup flags (sporadic,
+LRRK2, GBA, SNCA, PRKN, PINK1, other variant, hyposmia, RBD, normosmic), and
+the months since PD diagnosis for PD scans.
+
+Notes:
+- `SWEDD` stays `SWEDD` until a later diagnosis replaces it, which is common.
+- The genetic registry cohorts were recruited differently from the de novo
+  PD and healthy-control cohorts, so they are analysed separately.
+- MSA, PSP, DLB, AD, FTD and CBS labels in PPMI are clinical diagnoses made
+  during follow-up and are expected to be rare. They are reported
+  descriptively unless the minimum group size (10) is reached.
+
+### A.8 Eligibility flags and analysis sets
+
+| Analysis set | Scans included |
+|---|---|
+| **Primary PD vs HC (section 7.3)** | One scan per participant: the earliest QC-passed scan within the baseline window. PD = label `PD` from `COHORT` 1 (not genetic registry), `DXLVL` 1–2, no `conflict`, `transitional` or `stale` flag. HC = `COHORT` 2 with label `no_disorder` at the scan **and** no later neurological diagnosis at last contact (confirmed healthy control), with at least 12 months of follow-up after the scan |
+| DaT-deficit PD vs HC | Primary set, restricted to PD with an abnormal DaTscan |
+| Atypical parkinsonism (descriptive) | Scans labelled MSA, PSP, CBS or DLB, plus `later_revised` PD scans whose final diagnosis is one of these |
+| SWEDD | Scans labelled SWEDD, with their final diagnosis |
+| Prodromal and conversion | All scans labelled `prodromal`, with months to conversion and SAA status |
+| Longitudinal | All QC-passed scans with a time-of-scan label; participants flagged `unstable` removed in a sensitivity analysis |
+| Sensitivity: final diagnosis | Primary set relabelled with the final diagnosis |
+| Sensitivity: high confidence | Primary set with `DXLVL` = 1 only |
+| Sensitivity: genetic | Add `genetic_registry` PD and genetic-variant PD |
+
+Scans with `selected_mni2mm_nifti` missing, or with only pending or flagged
+QC results, receive a label but are not eligible for any analysis until QC
+passes.
+
+### A.9 Output: one row per scan
+
+`PATNO`, `exam_key`, scan date, scan month, visit ID (if linked), enrollment
+cohort and subgroup flags, `label_at_scan`, `label_source`, source record
+date, months since source record, `DXLVL`, `final_diagnosis` and its date,
+months of follow-up after the scan, months to conversion, flags
+(`transitional`, `later_revised`, `unstable`, `conflict`, `low_confidence`,
+`stale`, `unconfirmed_cohort_only`, `genetic_registry`), model class, DaTscan
+result and interval, SAA status and interval, QC status, analysis-set
+eligibility, and the reason for any exclusion. The table holds
+participant-level data and stays on approved storage, not in this
+repository.
+
+### A.10 Values to confirm before lock
+
+- Baseline window: within 6 months of `ENROLL_DATE`.
+- Maximum age of a diagnostic record before the scan: 24 months.
+- Minimum follow-up for a confirmed healthy control: 12 months.
+- Confidence threshold: `DXLVL` 1–2 in primary analyses.
+- Same-month rule: scans in the month of a diagnosis change are transitional.
+- The diagnosis tables listed in A.1 need to be downloaded from PPMI. Until
+  then, only the enrollment fallback (rule 2) can be applied.
