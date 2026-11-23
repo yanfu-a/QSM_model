@@ -40,6 +40,8 @@ def date_range(value):
     else:
         if re.fullmatch(r"\d{4}-\d\d-\d\d(?:[T _].+)?", value):
             day = date.fromisoformat(value[:10])
+        elif re.fullmatch(r"\d{4}/\d{1,2}/\d{1,2}", value):
+            day = datetime.strptime(value, "%Y/%m/%d").date()
         else:
             day = datetime.strptime(value, "%m/%d/%Y").date()
         return DateRange(day, day)
