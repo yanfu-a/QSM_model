@@ -42,7 +42,8 @@ bash 02_Code/Session3_PPMI/run_scan_diagnosis_20261123.sh "" <output_dir>
 # Session 3: supplementary nearest-diagnosis match (may use records after the scan)
 cd 02_Code/Session3_PPMI && python3 build_nearest_diagnosis.py --scan-list ../../01_Data/PPMI/PPMI_selected_scans.csv \
     --research-dx ../../01_Data/PPMI/Primary_Research_Diagnosis_23Nov2026.csv \
-    --clinical-dx ../../01_Data/PPMI/Clinical_Diagnosis_23Nov2026.csv --out-dir <output_dir>
+    --clinical-dx ../../01_Data/PPMI/Clinical_Diagnosis_23Nov2026.csv \
+    --participant-status ../../01_Data/PPMI/Participant_Status_11Nov2026.csv --out-dir <output_dir>
 ```
 
 The PPMI matching scripts are the only code with tests (stdlib `unittest`):
@@ -56,9 +57,13 @@ cd 02_Code/Session3_PPMI && python3 -m unittest test_nearest_diagnosis.NearestDi
 PPMI diagnosis dates are month/year only while scan dates are exact days, so both
 matching scripts compare at calendar-month resolution. `build_scan_diagnosis.py`
 gives the time-of-scan label (no look-ahead); `build_nearest_diagnosis.py` imports
-its parsing and code mapping and may use later records. Only the `PRIMDXPD` page of
-the Primary Research Diagnosis export counts by default (`--research-page` to add
-others). The labeling design is Appendix A of `09_Design/study_design.md`.
+its parsing and code mapping and may use later records. In `build_scan_diagnosis.py`
+only the `PRIMDXPD` page of the Primary Research Diagnosis export counts by default
+(`--research-page` to add others); `build_nearest_diagnosis.py` uses all four pages,
+ranks sources (Clinical_Diagnosis > PRIMDXPD page > CLINDX/DIAGQUES/PRODDIAG pages)
+only to break disagreements at the same distance, and uses the Participant_Status
+enrollment cohort only as a fallback. The labeling design is Appendix A of
+`09_Design/study_design.md` (A.11 for the nearest match).
 
 Python dependencies (from imports): torch, torchvision, nibabel, numpy, pandas,
 scipy, scikit-learn, tqdm; `Optional_Models/model_multimodal.py` also needs

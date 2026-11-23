@@ -793,3 +793,37 @@ repository.
 - Same-month rule: scans in the month of a diagnosis change are transitional.
 - The diagnosis tables listed in A.1 need to be downloaded from PPMI. Until
   then, only the enrollment fallback (rule 2) can be applied.
+
+### A.11 Supplementary nearest-diagnosis match
+
+A second, separate match (`build_nearest_diagnosis.py`, output
+`PPMI_scan_nearest_diagnosis_*.csv`) assigns each scan the diagnosis record
+nearest to its acquisition date, before or after it. Because it can use later
+records, it is never the primary time-of-scan label (A.4); it is used with its
+interval, for example to check or supplement time-of-scan labels.
+
+How each file contributes, in order of precedence:
+
+| Tier | File and form | Field and date | Role |
+|---|---|---|---|
+| 1 | Clinical_Diagnosis, `NEWCLINDX` | `NEWDIAG`, dated by `INFODT` (`DIAGDT` reported alongside) | Diagnosis record |
+| 2 | Primary_Research_Diagnosis, `PRIMDXPD` page | `PRIMDIAG`, dated by `INFODT`; `DXLVL` kept | Diagnosis record |
+| 3 | Primary_Research_Diagnosis, `CLINDX`, `DIAGQUES`, `PRODDIAG` pages | `PRIMDIAG`, dated by `INFODT` | Diagnosis record; the `PRODDIAG` page holds most prodromal codes |
+| 4 | Participant_Status | `COHORT`, dated by `ENROLL_DATE` | Fallback only, when no dated diagnosis record exists; always reported as `enroll_*` columns |
+
+Rules:
+- The nearest record is chosen by distance in calendar months alone. Precedence is
+  used only when records at the same nearest distance disagree: the highest tier
+  present wins if it is unanimous (`resolved_by_source_precedence`), and the
+  overruled records are listed. Disagreement within the top tier, or between
+  equally distant records before and after the scan, leaves the scan unassigned.
+- Among agreeing records, the one before the scan, then the higher tier, then the
+  higher `DXLVL` confidence, is reported.
+- Every matched row keeps its source file, form, tier, record ID (`REC_ID`, or the
+  participant ID for enrollment records), visit, date, timing and interval, all
+  records at the nearest distance, and whether the label differs from the
+  enrollment cohort.
+- Undated records (`DIAGQUES` rows without `INFODT`) are counted but not used.
+- Code 17 ("No PD nor other neurological disorder") in a participant enrolled as
+  prodromal or SWEDD is not a healthy control; the enrollment cohort columns keep
+  this distinction.
